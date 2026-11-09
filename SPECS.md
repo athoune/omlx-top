@@ -132,7 +132,13 @@ Notes:
   call** and moved between 10.4 GB and 11.4 GB within minutes on the same
   machine, tracking system pressure. It is not a constant.
 - `GET /v1/models/status` returns **all** discovered models (20 here), not just
-  loaded ones.
+  loaded ones. One of them is not a model at all: `MarkItDown` is the built-in
+  document converter (`model_path: "builtin://markitdown"`,
+  `engine_type: "markitdown"`, size 0). The app's own counters exclude it —
+  `/api/status.models_discovered` reports 19 while `model_count` reports 20.
+  Treating it as a model would make "1 loaded" coexist with "0 B of model
+  memory". Built-ins are therefore filtered out of every `models.*` counter and
+  out of the TUI table (§8.1).
 
 Full `/api/status` payload (as of 0.7.3):
 
@@ -300,6 +306,8 @@ src/
   cli.rs             argument parsing, env fallbacks
   config.rs          URL/port resolution, intervals, thresholds
   model.rs           Snapshot, HostMetrics, ProcessMetrics, GpuMetrics, serving structs
+  sampler/
+    mod.rs           per-tick snapshot assembly, CPU warm-up for one-shot mode
   http/
     mod.rs           client construction, retry/backoff, error classification
     endpoints.rs     typed GETs + exact serde structs for the four endpoints
@@ -332,6 +340,12 @@ Flavor `RUSAGE_INFO_V0`: it has existed since macOS 10.9 and carries the three
 fields we need (`ri_user_time`, `ri_system_time`, `ri_phys_footprint`). Later
 flavors add fields we would not display, at the cost of a 30-field hand-written
 struct whose layout could silently drift.
+
+In the TUI, the window is the sampling interval (2 s default). In one-shot mode
+(`--once`, `--json`) there is no previous tick, so the sampler takes two readings
+separated by `--warmup` (default 250 ms) and reports the CPU over that window.
+A 250 ms window is noisier than a 2 s average and the README says so; `--warmup 0`
+skips it and reports `null` CPU rather than inventing a number.
 
 ```
 Δticks = (ri_user_time + ri_system_time)[t] - [...][t-1]     // mach absolute time
@@ -431,6 +445,11 @@ convert one into the other.
 | `/admin/api/stats` | every 5th tick, only if the first attempt returned 200 | `--admin` to force probe | optional thresholds |
 
 `--interval` accepts 500 ms–60 s, clamped with a warning.
+
+The models cache is invalidated immediately, without waiting for its TTL, when
+`/api/status.models_loaded` disagrees with the filtered count of the cached list
+— a model finished loading or unloading. This keeps §8.1's consistency rule from
+turning a 30 s cache into a visible contradiction.
 
 **Monitoring perturbs the measurement.** Each `/api/status` call costs ~3 ms of
 CPU inside the Python process being measured. At 2 s that is ~0.15 % of a core —
@@ -661,6 +680,8 @@ omlx-top [OPTIONS]
                        (listening socket, §6.3.3), else http://127.0.0.1:8000
   --api-key <KEY>      Bearer token; env OMLX_API_KEY
   --interval <DUR>     sampling period, e.g. 2s, 500ms (default 2s)
+  --warmup <DUR>       measurement window used by --once/--json to obtain a
+                       CPU delta (default 250ms; 0 reports null CPU)
   --once               print one snapshot as text, exit 0/1
   --json               print one snapshot as JSON, exit 0/1 (implies --once)
   --list               print discovered instances (mode, pid, port) and exit
@@ -711,7 +732,7 @@ stderr).
     "avg_generation_tps": 0.0
   },
   "models": {
-    "discovered": 20,
+    "discovered": 19,
     "loaded_count": 1,
     "loading_count": 0,
     "memory_used_bytes": 288687808,
@@ -744,6 +765,18 @@ Absent or unavailable values are `null`, never `0`. A consumer must be able to
 distinguish "idle" from "unknown". In `service` and `manual` mode,
 `processes.app` is `null` (there is no GUI process to measure); in `app` mode it
 is an object.
+
+`models.discovered`, `models.loaded_count`, `models.loading_count` and
+`models.loaded` are derived from **one** source so they never contradict each
+other: `/v1/models/status` when available (filtered), else `/api/status`.
+Consequently `loaded_count == loaded.len()` whenever that per-model source is
+used. Built-in engines — `model_path` beginning with `builtin://`, or
+`engine_type`/`model_type` equal to `markitdown` — are excluded from all four.
+
+The `/health` last resort carries counters but no per-model ids. It reports
+`loaded_count` from `engine_pool.loaded_count` and `loaded: null` (unknown),
+never `[]`: an empty array must keep meaning "fetched, nothing loaded". When no
+source answers, both are `null`.
 
 ## 9. Failure and degradation matrix
 

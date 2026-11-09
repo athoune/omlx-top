@@ -198,7 +198,10 @@ pub fn pressure_label(level: u32) -> &'static str {
 }
 
 /// Combine the kernel level with the derived used/total ratio.
-pub fn pressure(level: u32, total_bytes: u64, used_bytes: u64) -> Pressure {
+///
+/// `level` is `None` when the sysctl failed: the ratio is still useful, and the
+/// missing kernel signal must stay `null` rather than becoming a fake `normal`.
+pub fn pressure(level: Option<u32>, total_bytes: u64, used_bytes: u64) -> Pressure {
     let used_ratio = if total_bytes == 0 {
         None
     } else {
@@ -207,7 +210,7 @@ pub fn pressure(level: u32, total_bytes: u64, used_bytes: u64) -> Pressure {
 
     Pressure {
         kernel_level: level,
-        kernel_label: pressure_label(level).to_string(),
+        kernel_label: level.map(|level| pressure_label(level).to_string()),
         used_ratio,
     }
 }
@@ -320,13 +323,18 @@ mod tests {
 
     #[test]
     fn pressure_ratio_is_derived_separately() {
-        let warning = pressure(2, 100, 78);
-        assert_eq!(warning.kernel_level, 2);
-        assert_eq!(warning.kernel_label, "warning");
+        let warning = pressure(Some(2), 100, 78);
+        assert_eq!(warning.kernel_level, Some(2));
+        assert_eq!(warning.kernel_label.as_deref(), Some("warning"));
         assert_eq!(warning.used_ratio, Some(0.78));
 
-        let unavailable = pressure(1, 0, 0);
+        let unavailable = pressure(Some(1), 0, 0);
         assert_eq!(unavailable.used_ratio, None);
+
+        let missing_level = pressure(None, 100, 78);
+        assert_eq!(missing_level.kernel_level, None);
+        assert_eq!(missing_level.kernel_label, None);
+        assert_eq!(missing_level.used_ratio, Some(0.78));
     }
 
     #[test]

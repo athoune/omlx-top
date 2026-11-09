@@ -1,0 +1,1 @@
+{"status":"healthy","default_model":"gemma-4-e4b-it-OptiQ-4bit","engine_pool":{"model_count":19,"loaded_count":0,"final_ceiling":10298433956,"current_model_memory":0},"mcp":null}

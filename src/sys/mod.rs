@@ -4,6 +4,7 @@
 //! spawns a child process (no `ioreg`, `ps`, `lsof`, `launchctl` or `top`).
 
 pub mod discover;
+pub mod gpu;
 pub mod info;
 pub mod proc;
 pub mod socket;
