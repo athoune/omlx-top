@@ -49,7 +49,8 @@ required.
 ```
 launchd (pid 1)
 └─ omlx-server
-   exe:  /opt/homebrew/Cellar/omlx/0.7.3/libexec/bin/python3.11
+   exe:  /opt/homebrew/Cellar/python@3.11/3.11.18/Frameworks/Python.framework/
+         Versions/3.11/Resources/Python.app/Contents/MacOS/Python
    argv: /opt/homebrew/opt/omlx/bin/omlx serve       (rewritten, see below)
    env:  OMLX_SUPERVISED=launchd
    plist: /opt/homebrew/opt/omlx/sh.brew.omlx.plist
@@ -58,18 +59,29 @@ launchd (pid 1)
           WorkingDirectory=/opt/homebrew/var
 ```
 
+The Homebrew venv is a **framework** Python: the shebang in
+`/opt/homebrew/opt/omlx/bin/omlx` points at
+`.../Cellar/omlx/<version>/libexec/bin/python3.11`, but the running executable is
+the framework's `Python.app` binary. The resulting `proc_pidpath` therefore
+contains **no `omlx` segment at all** — only `Cellar/python@3.11/...`. The app
+bundle uses a plain venv Python instead
+(`/Applications/oMLX.app/Contents/Resources/Python/cpython-3.11/bin/python3.11`).
+Both layouts must be recognised.
+
 **C. Manual** — `omlx serve` from a shell: child of the user's shell, same
 `omlx-server` title.
 
 Facts that drive the design:
 
 - The server rewrites its own **argv** (`omlx/process_title.py` → `setproctitle`),
-  but **`p_comm` stays the interpreter name**. Measured on pid 93916:
-  `proc_name`, `PROC_PIDTBSDINFO.pbi_comm` and `sysctl KERN_PROC_PID` all return
-  `python3.11`; `KERN_PROCARGS2` returns `argv[0] == "omlx-server"`. `ps -o comm`
-  displays `omlx-server` because macOS `ps` derives that column from argv — it is
-  not evidence about `p_comm`. Candidate detection must therefore not rely on
-  `p_comm` alone (§6.3.1).
+  but **`p_comm` stays the interpreter name**, and that name differs per
+  distribution: `python3.11` for the app bundle, `Python` (capital, framework
+  build) for the Homebrew service. Measured: `proc_name`,
+  `PROC_PIDTBSDINFO.pbi_comm` and `sysctl KERN_PROC_PID` all return the
+  interpreter name; `KERN_PROCARGS2` returns `argv[0] == "omlx-server"` and
+  zeroed `argv[1..]`. `ps -o comm` displays `omlx-server` because macOS `ps`
+  derives that column from argv — it is not evidence about `p_comm`. Candidate
+  detection must therefore not rely on `p_comm` alone (§6.3.1).
 - The Homebrew Cellar path embeds the version (`.../omlx/0.7.3/...`) and moves
   on `brew upgrade`. **Never hardcode it.**
 - The plist exists on disk even when the service is not loaded (`brew services
@@ -468,19 +480,29 @@ and accept a process when **any** of these holds, cheapest first:
 2. `proc_pidpath` contains `/oMLX.app/Contents/Resources/Python/` — the
    app-bundle server;
 3. `proc_pidpath` contains `/Cellar/omlx/` or `/opt/omlx/` — a Homebrew install
-   under any prefix;
-4. the executable basename starts with `python3` **and** `KERN_PROCARGS2`
-   `argv[0]` has basename `omlx` or `omlx-server` — covers manual `omlx serve`,
-   pipx/uv installs, and any layout not covered above. This is the only rule
+   under any prefix, when the venv Python is *not* a framework build;
+4. **the executable looks like a Python interpreter** and `KERN_PROCARGS2`
+   `argv[0]` has basename `omlx` or `omlx-server`. "Looks like a Python
+   interpreter" means, case-insensitively, that the basename starts with
+   `python` **or** the path contains `/Python.framework/`. This is the only rule
    that reads the argument block, and it only runs for interpreter paths.
+
+Rule 4 is what actually catches a Homebrew **framework** install, whose
+`proc_pidpath` is
+`.../Cellar/python@3.11/<version>/Frameworks/Python.framework/.../Python.app/Contents/MacOS/Python`
+with basename `Python` — no `omlx` segment anywhere, and a name that a
+lowercase-only `python3` check would miss.
 
 Never accept on an environment token alone: `OMLX_*` variables are inherited by
 unrelated children of a shell that exported them. The environment is used for
 `OMLX_PORT` / `OMLX_SUPERVISED` only, after a process has been accepted.
 
-Measured on the reference machine: 1 python process, accepted by rule 4
-(`argv[0] == "omlx-server"`), path
-`/Applications/oMLX.app/Contents/Resources/Python/cpython-3.11/bin/python3.11`.
+Measured on the reference machine:
+
+| Mode | `proc_pidpath` | basename | `p_comm` | accepted by |
+|---|---|---|---|---|
+| app | `/Applications/oMLX.app/Contents/Resources/Python/cpython-3.11/bin/python3.11` | `python3.11` | `python3.11` | rule 2 |
+| service | `.../Cellar/python@3.11/3.11.18/Frameworks/Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python` | `Python` | `Python` | rule 4 |
 
 Candidates not owned by the current user are recorded and reported, never
 silently dropped (§9).
@@ -785,9 +807,10 @@ If the budget is missed, the order of fixes is: raise the default interval to
 - **Unit:** mode classification over synthetic parent chains (`ppid == 1`,
   app-bundle ancestor, shell ancestor, EPERM gap).
 - **Unit:** candidate signature matrix — app-bundle path, `/Cellar/omlx/` path,
-  interpreter path with `argv[0] == "omlx-server"`, interpreter path with an
-  unrelated argv, and a process carrying `OMLX_PORT` in its environment but not
-  accepted on that basis alone.
+  framework `Python.app` path (capital `Python`), plain `python3.11` path with
+  `argv[0] == "omlx-server"`, interpreter path with an unrelated argv, and a
+  process carrying `OMLX_PORT` in its environment but not accepted on that basis
+  alone.
 - **Unit:** URL precedence (explicit `--url` > socket > `OMLX_PORT` >
   `settings.json` > 8000 > 8008).
 - **Integration (manual, documented in README):**

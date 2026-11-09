@@ -103,7 +103,9 @@ fn basename(path: &str) -> &str {
 
 fn is_interpreter_path(path: &str) -> bool {
     let name = basename(path);
-    name.starts_with("python3") || name == "python"
+    // SPECS.md section 6.3.1: case-insensitive basename prefix, or a
+    // framework build whose executable is `Python.app/Contents/MacOS/Python`.
+    name.to_ascii_lowercase().starts_with("python") || path.contains("/Python.framework/")
 }
 
 /// Scan the process table and classify every oMLX server candidate.
@@ -406,6 +408,8 @@ mod tests {
             "/Applications/oMLX.app/Contents/Resources/Python/cpython-3.11/bin/python3.11";
         let cellar_path = "/opt/homebrew/Cellar/omlx/0.7.3/libexec/bin/python3.11";
         let opt_path = "/opt/omlx/bin/python3";
+        let framework_path = "/opt/homebrew/Cellar/python@3.11/3.11.18/Frameworks/\
+Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python";
 
         // Rule 1: kernel p_comm is already the server name.
         assert!(signature_matches(Some("omlx-server"), None, None));
@@ -426,6 +430,21 @@ mod tests {
             Some("/opt/omlx/bin/omlx")
         ));
 
+        // Rule 4 accepts every interpreter spelling in SPECS.md, including
+        // the capitalised framework name and the Python.framework path.
+        for name in ["Python", "python", "python3", "python3.11", "python3.13"] {
+            let path = format!("/usr/bin/{name}");
+            assert!(
+                signature_matches(None, Some(path.as_str()), Some("omlx-server")),
+                "{name} should be treated as an interpreter"
+            );
+        }
+        assert!(signature_matches(
+            Some("Python"),
+            Some(framework_path),
+            Some("omlx-server")
+        ));
+
         // Rule 4 never accepts an unrelated argv[0], a missing argv[0], or a
         // non-interpreter executable.
         assert!(!signature_matches(
@@ -434,6 +453,34 @@ mod tests {
             Some("/usr/bin/other")
         ));
         assert!(!signature_matches(None, Some("/usr/bin/python3"), None));
+        assert!(!signature_matches(
+            Some("Python"),
+            Some(framework_path),
+            Some("serve")
+        ));
+        assert!(!signature_matches(None, Some(framework_path), None));
+        assert!(!signature_matches(
+            None,
+            Some("/usr/bin/ruby"),
+            Some("omlx-server")
+        ));
+    }
+
+    #[test]
+    fn framework_python_requires_omlx_argv0() {
+        let framework_path = "/opt/homebrew/Cellar/python@3.11/3.11.18/Frameworks/\
+Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python";
+
+        assert!(signature_matches(
+            Some("Python"),
+            Some(framework_path),
+            Some("omlx-server")
+        ));
+        assert!(!signature_matches(
+            Some("Python"),
+            Some(framework_path),
+            Some("/usr/bin/other")
+        ));
         assert!(!signature_matches(
             None,
             Some("/usr/bin/ruby"),
