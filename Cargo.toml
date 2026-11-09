@@ -1,0 +1,22 @@
+[package]
+name = "omlx-top"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only macOS monitor for oMLX resource usage"
+publish = false
+
+[[bin]]
+name = "omlx-top"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
