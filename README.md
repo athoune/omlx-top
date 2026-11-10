@@ -62,7 +62,7 @@ cargo build --release
 ./target/release/omlx-top
 ```
 
-From crates.io (once published), or from a checkout:
+From crates.io, or from a checkout:
 
 ```sh
 cargo install omlx-top
@@ -381,18 +381,19 @@ warning-free as well.
 scripts/release.sh 0.2.0 --push
 ```
 
-The script bumps `Cargo.toml`, refreshes `Cargo.lock`, runs `fmt`, `clippy` and
-the test suite, commits, and creates the annotated `v0.2.0` tag. Pushing the tag
-makes the CI build the Apple Silicon archive, create the GitHub release, upload
-`SHA256SUMS`, and attach SLSA provenance. Release notes are taken from
+The script bumps `Cargo.toml`, refreshes `Cargo.lock`, runs `fmt`, `clippy`, the
+test suite and `cargo publish --dry-run`, commits, and creates the annotated
+`v0.2.0` tag. Pushing the tag makes the CI build the Apple Silicon archive,
+publish the crate to crates.io, create the GitHub release, upload `SHA256SUMS`,
+and attach SLSA provenance. Release notes are taken from
 `docs/release-notes/v<version>.md` when that file exists; otherwise GitHub
 generates them from the commit history.
 
-Publishing to crates.io is a separate, deliberate step:
-
-```sh
-cargo publish
-```
+Crates.io publication uses [trusted publishing](https://docs.crates.io/crates-io/trusted-publishing):
+no token is stored in repository secrets. It requires a one-time configuration
+on crates.io — crate Settings → Trusted Publishing → GitHub publisher for
+`athoune/omlx-top`, workflow `rust.yml`. Without it the release job fails before
+creating the GitHub release, so nothing is published halfway.
 
 ## License
 

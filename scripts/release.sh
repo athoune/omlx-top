@@ -81,6 +81,10 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 
+# Pre-flight for the CI publish: package and verify the exact crate contents.
+# --allow-dirty because the version bump is not committed yet; nothing is sent.
+cargo publish --dry-run --allow-dirty
+
 if ! $skip_commit; then
     git add Cargo.toml Cargo.lock
     git commit -m "chore: release $tag"
