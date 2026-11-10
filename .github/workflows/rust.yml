@@ -3,10 +3,9 @@ name: Rust
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
-  release:
-    types: [ published ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,7 +34,8 @@ jobs:
       run: cargo build --release --target "$TARGET"
 
   release:
-    if: github.event_name == 'release'
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ test ]
     runs-on: macos-latest
     permissions:
       contents: write
@@ -74,10 +74,30 @@ jobs:
         rm -rf dist/stage
         (cd dist && shasum -a 256 "${name}.tar.gz" > SHA256SUMS)
         cat dist/SHA256SUMS
+    - name: Create the release as a draft
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        tag="${GITHUB_REF_NAME}"
+        if gh release view "$tag" >/dev/null 2>&1; then
+          echo "release $tag already exists; keeping its notes"
+          exit 0
+        fi
+        notes="docs/release-notes/${tag}.md"
+        if [ -f "$notes" ]; then
+          gh release create "$tag" --draft --title "omlx-top $tag" --notes-file "$notes"
+        else
+          gh release create "$tag" --draft --title "omlx-top $tag" --generate-notes
+        fi
     - name: Upload release assets
       env:
         GH_TOKEN: ${{ github.token }}
       run: gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz dist/SHA256SUMS --clobber
+    - name: Publish the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh release edit "${GITHUB_REF_NAME}" --draft=false
     - name: Generate provenance subject
       id: hash
       run: |
@@ -85,7 +105,7 @@ jobs:
         echo "digests=$(cd dist && shasum -a 256 *.tar.gz | base64 | tr -d '\n')" >> "$GITHUB_OUTPUT"
 
   provenance:
-    if: github.event_name == 'release'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [ release ]
     permissions:
       actions: read    # Required to detect the GitHub Actions environment.

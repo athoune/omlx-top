@@ -2,8 +2,14 @@
 name = "omlx-top"
 version = "0.1.0"
 edition = "2021"
-description = "Read-only macOS monitor for oMLX resource usage"
-publish = false
+rust-version = "1.82"
+description = "Read-only macOS terminal monitor for oMLX resource usage"
+license = "BSD-3-Clause"
+repository = "https://github.com/athoune/omlx-top"
+readme = "README.md"
+keywords = ["mlx", "omlx", "monitor", "tui", "macos"]
+categories = ["command-line-utilities", "development-tools::profiling"]
+exclude = ["/.github", "/dist"]
 
 [[bin]]
 name = "omlx-top"

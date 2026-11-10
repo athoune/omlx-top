@@ -62,8 +62,16 @@ cargo build --release
 ./target/release/omlx-top
 ```
 
-The binary is `target/release/omlx-top`. There is no Homebrew formula yet:
-either run it from the build directory or copy it somewhere on `PATH`
+From crates.io (once published), or from a checkout:
+
+```sh
+cargo install omlx-top
+cargo install --path .
+```
+
+The binary is `target/release/omlx-top`, or `~/.cargo/bin/omlx-top` after
+`cargo install`. There is no Homebrew formula yet: either run it from the build
+directory or copy it somewhere on `PATH`
 (`install -m 755 target/release/omlx-top ~/.local/bin/`).
 
 ## Usage
@@ -366,6 +374,25 @@ cargo fmt --check
 Tests use captured payloads in `tests/golden/` and synthetic process tables;
 none needs a network or a running oMLX. `cargo build --release` must stay
 warning-free as well.
+
+## Releasing
+
+```sh
+scripts/release.sh 0.2.0 --push
+```
+
+The script bumps `Cargo.toml`, refreshes `Cargo.lock`, runs `fmt`, `clippy` and
+the test suite, commits, and creates the annotated `v0.2.0` tag. Pushing the tag
+makes the CI build the Apple Silicon archive, create the GitHub release, upload
+`SHA256SUMS`, and attach SLSA provenance. Release notes are taken from
+`docs/release-notes/v<version>.md` when that file exists; otherwise GitHub
+generates them from the commit history.
+
+Publishing to crates.io is a separate, deliberate step:
+
+```sh
+cargo publish
+```
 
 ## License
 
