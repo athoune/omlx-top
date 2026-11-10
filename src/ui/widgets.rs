@@ -10,7 +10,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 
 use crate::format;
-use crate::model::{ModelRow, ServerBlock};
+use crate::model::{ModelRow, Pressure, ServerBlock};
 
 /// The header status badge (SPECS.md section 7.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +80,85 @@ pub fn level(value: f64, warning: f64, critical: f64) -> Level {
         Level::Warning
     } else {
         Level::Normal
+    }
+}
+
+/// Memory-pressure alert state (SPECS.md section 5.7).
+///
+/// The kernel level is authoritative and the derived ratio is only a fallback
+/// when the kernel signal is missing. Keeping the two sources separate here is
+/// what stops the sticky kernel level from being silently converted into the
+/// ratio, or the other way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alert {
+    Normal,
+    Warning,
+    Critical,
+    Unknown,
+}
+
+impl Alert {
+    /// The word printed next to the row, so the state never depends on colour
+    /// alone (SPECS.md section 7.3).
+    pub fn label(self) -> &'static str {
+        match self {
+            Alert::Normal => "normal",
+            Alert::Warning => "warning",
+            Alert::Critical => "critical",
+            Alert::Unknown => "unknown",
+        }
+    }
+}
+
+/// Ratio thresholds used only when `kern.memorystatus_vm_pressure_level` is
+/// unavailable (SPECS.md section 5.7).
+const PRESSURE_WARNING_RATIO: f64 = 0.70;
+const PRESSURE_CRITICAL_RATIO: f64 = 0.85;
+
+/// Derive the alert state exactly as the SPECS.md section 5.7 table reads.
+///
+/// An undocumented kernel value (for example `3`) is `unknown` rather than
+/// being re-derived from the ratio: the kernel answered, so the ratio fallback
+/// does not apply.
+pub fn alert(pressure: Option<&Pressure>) -> Alert {
+    let Some(pressure) = pressure else {
+        return Alert::Unknown;
+    };
+
+    if let Some(level) = pressure.kernel_level {
+        return match level {
+            4 => Alert::Critical,
+            2 => Alert::Warning,
+            1 => Alert::Normal,
+            _ => Alert::Unknown,
+        };
+    }
+
+    match pressure.used_ratio {
+        Some(ratio) if ratio >= PRESSURE_CRITICAL_RATIO => Alert::Critical,
+        Some(ratio) if ratio >= PRESSURE_WARNING_RATIO => Alert::Warning,
+        _ => Alert::Unknown,
+    }
+}
+
+/// Style for the pressure row and the header banner.
+///
+/// `critical` is red and bold, `warning` colours the row only, and `unknown`
+/// stays unstyled: a reassuring green would be a claim the data cannot back.
+pub fn alert_style(alert: Alert, no_color: bool) -> Style {
+    let level = match alert {
+        Alert::Normal => Level::Normal,
+        Alert::Warning => Level::Warning,
+        Alert::Critical => Level::Critical,
+        Alert::Unknown => return Style::default(),
+    };
+    let style = level_style(level, no_color);
+    if alert == Alert::Critical {
+        // Bold survives `--no-color`, so the banner keeps its emphasis while
+        // the word alone still carries the meaning.
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
     }
 }
 
@@ -405,6 +484,99 @@ mod tests {
         assert_eq!(level(50.0, 50.0, 80.0), Level::Warning);
         assert_eq!(level(80.0, 50.0, 80.0), Level::Critical);
         assert_eq!(level(0.0, 60.0, 85.0), Level::Normal);
+    }
+
+    fn pressure_with(level: Option<u32>, ratio: Option<f64>) -> Pressure {
+        Pressure {
+            kernel_level: level,
+            kernel_label: level.map(|level| crate::sys::vm::pressure_label(level).to_string()),
+            used_ratio: ratio,
+        }
+    }
+
+    fn alert_of(level: Option<u32>, ratio: Option<f64>) -> Alert {
+        alert(Some(&pressure_with(level, ratio)))
+    }
+
+    #[test]
+    fn alert_follows_the_kernel_level_whatever_the_ratio_says() {
+        // The kernel signal wins even when the two disagree: a sticky level 4
+        // with a low ratio stays critical, and a level 1 with a high ratio
+        // stays normal instead of being re-derived from the ratio.
+        assert_eq!(alert_of(Some(4), Some(0.10)), Alert::Critical);
+        assert_eq!(alert_of(Some(2), Some(0.95)), Alert::Warning);
+        assert_eq!(alert_of(Some(1), Some(0.95)), Alert::Normal);
+        assert_eq!(alert_of(Some(1), None), Alert::Normal);
+    }
+
+    #[test]
+    fn alert_ignores_the_ratio_for_undocumented_kernel_values() {
+        // The kernel answered, so the ratio fallback does not apply; the
+        // integer will be visible in the row instead.
+        assert_eq!(alert_of(Some(3), Some(0.95)), Alert::Unknown);
+        assert_eq!(alert_of(Some(0), Some(0.95)), Alert::Unknown);
+        assert_eq!(alert_of(Some(9), Some(0.95)), Alert::Unknown);
+    }
+
+    #[test]
+    fn alert_uses_the_ratio_only_when_the_kernel_level_is_missing() {
+        assert_eq!(alert_of(None, Some(1.0)), Alert::Critical);
+        assert_eq!(alert_of(None, Some(0.85)), Alert::Critical);
+        assert_eq!(alert_of(None, Some(0.849)), Alert::Warning);
+        assert_eq!(alert_of(None, Some(0.70)), Alert::Warning);
+        assert_eq!(alert_of(None, Some(0.699)), Alert::Unknown);
+        assert_eq!(alert_of(None, Some(0.10)), Alert::Unknown);
+    }
+
+    #[test]
+    fn alert_without_any_signal_stays_unknown() {
+        assert_eq!(alert(None), Alert::Unknown);
+        assert_eq!(alert_of(None, None), Alert::Unknown);
+        assert_eq!(Alert::Unknown.label(), "unknown");
+    }
+
+    #[test]
+    fn every_alert_states_its_word_and_survives_no_color() {
+        assert_eq!(Alert::Normal.label(), "normal");
+        assert_eq!(Alert::Warning.label(), "warning");
+        assert_eq!(Alert::Critical.label(), "critical");
+        for alert in [
+            Alert::Normal,
+            Alert::Warning,
+            Alert::Critical,
+            Alert::Unknown,
+        ] {
+            assert!(!alert.label().is_empty());
+            // Styling must be safe to drop without losing the meaning.
+            let _ = alert_style(alert, true);
+        }
+        assert!(
+            alert_style(Alert::Critical, false)
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "critical is bold"
+        );
+    }
+
+    #[test]
+    fn alert_styles_are_red_and_bold_only_at_critical() {
+        let critical = alert_style(Alert::Critical, false);
+        assert_eq!(critical.fg, Some(Color::Red));
+        assert!(critical.add_modifier.contains(Modifier::BOLD));
+
+        // Warning colours the row and nothing else: no bold, no banner.
+        let warning = alert_style(Alert::Warning, false);
+        assert_eq!(warning.fg, Some(Color::Yellow));
+        assert!(!warning.add_modifier.contains(Modifier::BOLD));
+
+        // Unknown is not a reassuring green.
+        let unknown = alert_style(Alert::Unknown, false);
+        assert_eq!(unknown, Style::default());
+
+        // `--no-color` drops the colour but keeps the emphasis and the word.
+        let mono = alert_style(Alert::Critical, true);
+        assert_eq!(mono.fg, None);
+        assert!(mono.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

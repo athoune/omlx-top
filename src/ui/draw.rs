@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, TableState, Wrap};
 use ratatui::Frame;
 
-use super::widgets::{self, Badge, Level};
+use super::widgets::{self, Alert, Badge, Level};
 use super::{seen_ago_seconds, App, Ring};
 use crate::format;
 use crate::model::{ModelRow, Serving, Snapshot};
@@ -125,6 +125,43 @@ fn gauge_span(ratio: Option<f64>, width: usize, no_color: bool, level: Level) ->
     Span::styled(cells, widgets::level_style(level, no_color))
 }
 
+/// Display width of the text a [`label_span`] produces: the label padded to
+/// nine columns, plus one separating space.
+fn label_span_width(label: &str) -> usize {
+    label.chars().count().max(9) + 1
+}
+
+/// Cells a gauge consumes besides its bars: the two brackets and the blank
+/// cell that keeps the column boundary visible.
+const GAUGE_DECORATION: usize = 3;
+/// Below this many bars a gauge says nothing useful, so the caller drops it.
+const MIN_GAUGE_BARS: usize = 3;
+const MAX_GAUGE_BARS: usize = 24;
+
+/// Number of bars that keeps `[bars]` plus `prefix_width` inside a column of
+/// `column_width` cells, leaving one blank cell before the neighbour column.
+///
+/// The prefix carries formatted byte counts, whose width changes with the
+/// value (`0 B` versus `275.3M`): a fixed subtraction pushed the bars into the
+/// right column as soon as a number grew. `None` means there is no room left,
+/// and the row is rendered as text only.
+fn gauge_bars(column_width: u16, prefix_width: usize) -> Option<usize> {
+    let free = usize::from(column_width)
+        .saturating_sub(prefix_width)
+        .saturating_sub(GAUGE_DECORATION);
+    (free >= MIN_GAUGE_BARS).then(|| free.min(MAX_GAUGE_BARS))
+}
+
+/// Whether a text row built from `widths` cells fits a column of
+/// `column_width`, keeping the same one-cell separation as the gauges.
+///
+/// Text rows (`RAM`, `SYS`) also grow with their byte counts. Rather than
+/// letting a pathological value run into the neighbouring column, the caller
+/// drops its least important suffix when the row would no longer fit.
+fn row_fits(column_width: u16, widths: &[usize]) -> bool {
+    widths.iter().sum::<usize>() < usize::from(column_width)
+}
+
 /// `mode:port`, from the selected instance when there is one.
 fn endpoint(snapshot: Option<&Snapshot>) -> String {
     let Some(snapshot) = snapshot else {
@@ -164,6 +201,18 @@ fn header_line(app: &App) -> Line<'static> {
     }
     if badge == Badge::Auth {
         spans.push(plain("  (pass --api-key)"));
+    }
+
+    // The pressure alert is derived from the current snapshot and comes before
+    // the informational segments, so the documented 80-column minimum never
+    // clips it mid-word (the same priority rule as `paused`). Nothing redraws
+    // or blinks on its own (SPECS.md section 5.7).
+    let alert = widgets::alert(snapshot.and_then(|snapshot| snapshot.system.pressure.as_ref()));
+    if alert == Alert::Critical {
+        spans.push(Span::styled(
+            "  ⚠ PRESSURE CRITICAL",
+            widgets::alert_style(Alert::Critical, app.no_color),
+        ));
     }
 
     // Paused and the instance indicator come before the informational
@@ -222,6 +271,11 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App, stacked: bool) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
     };
 
+    // Each column is rendered into its own rect, so a row longer than the
+    // column is clipped by the Paragraph and can never paint over its
+    // neighbour. Rows that carry a gauge additionally size it from the real
+    // label text (`gauge_bars`), so the bars stop one cell short of the
+    // boundary instead of being cut in half by the clip.
     frame.render_widget(
         Paragraph::new(left_lines(app, columns[0].width)),
         columns[0],
@@ -296,18 +350,22 @@ fn left_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             },
         ])
     } else {
-        Line::from(vec![
-            label_span("RAM"),
-            plain(format!("footprint {}", bytes_or_dash(footprint))),
-            match footprint_ratio {
-                Some(ratio) => plain(format!(" ({})", format::ratio_percent(ratio))),
-                None => plain(""),
-            },
-            match app_footprint {
-                Some(bytes) => plain(format!("   app {}", format::bytes(bytes))),
-                None => plain(""),
-            },
-        ])
+        let footprint_text = format!("footprint {}", bytes_or_dash(footprint));
+        let ratio_text = footprint_ratio.map_or_else(String::new, |ratio| {
+            format!(" ({})", format::ratio_percent(ratio))
+        });
+        let base =
+            label_span_width("RAM") + footprint_text.chars().count() + ratio_text.chars().count();
+        let mut text = footprint_text + &ratio_text;
+        // The GUI footprint is the least important cell of this row, so it is
+        // the one dropped when the row would no longer fit the column.
+        if let Some(bytes) = app_footprint {
+            let app_text = format!("   app {}", format::bytes(bytes));
+            if row_fits(width, &[base, app_text.chars().count()]) {
+                text.push_str(&app_text);
+            }
+        }
+        Line::from(vec![label_span("RAM"), plain(text)])
     };
 
     let models = snapshot.map(|snapshot| &snapshot.models);
@@ -318,7 +376,15 @@ fn left_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         _ => None,
     };
     let model_level = widgets::level(ratio.unwrap_or(0.0) * 100.0, 60.0, 85.0);
-    let gauge_width = (usize::from(width)).saturating_sub(34).clamp(6, 24);
+    let model_text = format!(
+        "{} / {} ceiling ",
+        bytes_or_dash(used),
+        bytes_or_dash(ceiling)
+    );
+    let model_bars = gauge_bars(
+        width,
+        label_span_width("MODEL") + model_text.chars().count(),
+    );
     let model_line = if snapshot.is_some_and(|snapshot| !snapshot.server.reachable) {
         Line::from(vec![
             muted(format!("{:<9} ", "MODEL"), no_color),
@@ -341,15 +407,11 @@ fn left_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             )),
         ])
     } else {
-        Line::from(vec![
-            label_span("MODEL"),
-            plain(format!(
-                "{} / {} ceiling ",
-                bytes_or_dash(used),
-                bytes_or_dash(ceiling)
-            )),
-            gauge_span(ratio, gauge_width, no_color, model_level),
-        ])
+        let mut spans = vec![label_span("MODEL"), plain(model_text)];
+        if let Some(bars) = model_bars {
+            spans.push(gauge_span(ratio, bars, no_color, model_level));
+        }
+        Line::from(spans)
     };
 
     let sys_used = memory.map(|memory| memory.used_bytes);
@@ -359,38 +421,47 @@ fn left_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         _ => None,
     };
     let sys_level = widgets::level(used_ratio.unwrap_or(0.0) * 100.0, 70.0, 85.0);
+    let sys_used_text = format!("used {}", bytes_or_dash(sys_used));
     let mut sys_first_spans = vec![
         label_span("SYS"),
         Span::styled(
-            format!("used {}", bytes_or_dash(sys_used)),
+            sys_used_text.clone(),
             widgets::level_style(sys_level, no_color),
         ),
     ];
     if !compact {
-        sys_first_spans.push(plain(format!(
-            "  wired {}",
-            bytes_or_dash(memory.map(|m| m.wired_bytes))
-        )));
+        // "wired" is context, not the subject: it goes when the row is wide
+        // enough only for the used figure.
+        let wired_text = format!("  wired {}", bytes_or_dash(memory.map(|m| m.wired_bytes)));
+        if row_fits(
+            width,
+            &[
+                label_span_width("SYS") + sys_used_text.chars().count(),
+                wired_text.chars().count(),
+            ],
+        ) {
+            sys_first_spans.push(plain(wired_text));
+        }
     }
     let sys_first = Line::from(sys_first_spans);
 
+    let cached_text = format!("cached {}", bytes_or_dash(memory.map(|m| m.cached_bytes)));
+    let free_text = format!("free {}", bytes_or_dash(memory.map(|m| m.free_bytes)));
     let sys_second = if compact {
+        Line::from(vec![label_span(""), plain(free_text)])
+    } else if row_fits(
+        width,
+        &[
+            label_span_width("") + cached_text.chars().count() + 2,
+            free_text.chars().count(),
+        ],
+    ) {
         Line::from(vec![
             label_span(""),
-            plain(format!(
-                "free {}",
-                bytes_or_dash(memory.map(|m| m.free_bytes))
-            )),
+            plain(format!("{cached_text}  {free_text}")),
         ])
     } else {
-        Line::from(vec![
-            label_span(""),
-            plain(format!(
-                "cached {}  free {}",
-                bytes_or_dash(memory.map(|m| m.cached_bytes)),
-                bytes_or_dash(memory.map(|m| m.free_bytes))
-            )),
-        ])
+        Line::from(vec![label_span(""), plain(free_text)])
     };
 
     vec![cpu, ram, model_line, sys_first, sys_second]
@@ -403,22 +474,29 @@ fn right_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let gpu = snapshot.and_then(|snapshot| snapshot.gpu.as_ref());
     let device = gpu.and_then(|gpu| gpu.device_util_percent).map(f64::from);
     let device_level = widgets::level(device.unwrap_or(0.0), 50.0, 80.0);
-    let gauge_width = (usize::from(width)).saturating_sub(26).clamp(6, 24);
+    let device_text = format!(" {}", percent_or_dash(device));
+    let device_bars = gauge_bars(
+        width,
+        label_span_width("GPU DEVICE") + device_text.chars().count(),
+    );
 
     let device_line = match gpu {
-        Some(_) => Line::from(vec![
-            label_span("GPU DEVICE"),
-            gauge_span(
-                device.map(|v| v / 100.0),
-                gauge_width,
-                no_color,
-                device_level,
-            ),
-            Span::styled(
-                format!(" {}", percent_or_dash(device)),
+        Some(_) => {
+            let mut spans = vec![label_span("GPU DEVICE")];
+            if let Some(bars) = device_bars {
+                spans.push(gauge_span(
+                    device.map(|v| v / 100.0),
+                    bars,
+                    no_color,
+                    device_level,
+                ));
+            }
+            spans.push(Span::styled(
+                device_text,
                 widgets::level_style(device_level, no_color),
-            ),
-        ]),
+            ));
+            Line::from(spans)
+        }
         None => Line::from(vec![
             label_span("GPU DEVICE"),
             muted("n/a", no_color),
@@ -482,27 +560,40 @@ fn right_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     ]);
 
     let pressure = snapshot.and_then(|snapshot| snapshot.system.pressure.as_ref());
+    let alert = widgets::alert(pressure);
     let pressure_text = match pressure {
-        Some(pressure) => {
-            let label = pressure.kernel_label.as_deref().unwrap_or("unknown");
-            let level = pressure
-                .kernel_level
-                .map_or_else(|| "?".to_string(), |level| level.to_string());
-            if compact {
-                format!("{label}({level})")
-            } else {
-                format!("PRESSURE {label} ({level})")
+        // The kernel level is authoritative; the raw integer is shown so an
+        // undocumented value is visible rather than quietly reinterpreted.
+        Some(pressure) => match pressure.kernel_level {
+            Some(level) => {
+                let label = pressure.kernel_label.as_deref().unwrap_or("unknown");
+                if compact {
+                    format!("{label}({level})")
+                } else {
+                    format!("PRESSURE {label} ({level})")
+                }
             }
-        }
+            // No kernel signal: the derived ratio drives the alert, so the row
+            // states the derived word and the ratio it came from.
+            None => match pressure.used_ratio {
+                Some(ratio) => {
+                    let text = format::ratio_percent(ratio);
+                    if compact {
+                        format!("{} {text}", alert.label())
+                    } else {
+                        format!("PRESSURE {} {text}", alert.label())
+                    }
+                }
+                None => "PRESSURE unknown".to_string(),
+            },
+        },
         None => "PRESSURE unknown".to_string(),
-    };
-    let pressure_level = match pressure.and_then(|pressure| pressure.kernel_level) {
-        Some(4) => Level::Critical,
-        Some(2) => Level::Warning,
-        _ => Level::Normal,
     };
     let system_cpu = snapshot.and_then(|snapshot| snapshot.system.cpu_percent);
     let system_cpu_level = widgets::level(system_cpu.unwrap_or(0.0), 50.0, 80.0);
+    // The line style colours the whole pressure row (label, separator and
+    // value) at `warning` and `critical`; the CPU span keeps its own threshold
+    // colour, because a memory alert says nothing about CPU.
     let cpu_pressure = Line::from(vec![
         label_span(if compact { "SYS" } else { "SYS CPU" }),
         Span::styled(
@@ -510,11 +601,9 @@ fn right_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             widgets::level_style(system_cpu_level, no_color),
         ),
         plain(if compact { " PRES " } else { "  " }),
-        Span::styled(
-            pressure_text,
-            widgets::level_style(pressure_level, no_color),
-        ),
-    ]);
+        Span::styled(pressure_text, widgets::alert_style(alert, no_color)),
+    ])
+    .style(widgets::alert_style(alert, no_color));
 
     vec![device_line, renderer, vram, compressed_swap, cpu_pressure]
 }
@@ -885,6 +974,170 @@ mod tests {
 
     fn render_to_string(app: &App, width: u16, height: u16) -> String {
         render_lines(app, width, height).join("\n")
+    }
+
+    fn render_buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("frame renders");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Display column of the first cell of `needle`, scanning rows in order.
+    fn cell_at(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in 0..buffer.area.height {
+            let mut text = String::new();
+            let mut columns = Vec::new();
+            for x in 0..buffer.area.width {
+                for ch in buffer[(x, y)].symbol().chars() {
+                    text.push(ch);
+                    columns.push(x);
+                }
+            }
+            if let Some(byte_index) = text.find(needle) {
+                let char_index = text[..byte_index].chars().count();
+                return Some((columns[char_index], y));
+            }
+        }
+        None
+    }
+
+    fn snapshot_with_pressure(level: Option<u32>, ratio: Option<f64>) -> crate::model::Snapshot {
+        let mut snapshot = synthetic_snapshot();
+        snapshot.system.pressure = Some(crate::model::Pressure {
+            kernel_level: level,
+            kernel_label: level.map(|level| crate::sys::vm::pressure_label(level).to_string()),
+            used_ratio: ratio,
+        });
+        snapshot
+    }
+
+    #[test]
+    fn critical_pressure_is_announced_in_the_header() {
+        let mut app = App::new(false, Duration::from_secs(2));
+        app.apply_snapshot(snapshot_with_pressure(Some(4), Some(0.42)));
+        let lines = render_lines(&app, 100, 40);
+        let header = lines.first().expect("header row");
+        assert!(header.contains("PRESSURE CRITICAL"), "header: {header:?}");
+
+        // The banner sits before the informational segments, so the documented
+        // 80-column minimum shows it in full instead of cutting it mid-word.
+        let narrow = render_lines(&app, 80, 24);
+        assert!(
+            narrow[0].contains("\u{26a0} PRESSURE CRITICAL"),
+            "80-column header: {:?}",
+            narrow[0]
+        );
+
+        // Level 2 colours the row only: a banner for a state that lasts hours
+        // becomes wallpaper (SPECS.md section 5.7).
+        let mut warning = App::new(false, Duration::from_secs(2));
+        warning.apply_snapshot(snapshot_with_pressure(Some(2), Some(0.42)));
+        let text = render_to_string(&warning, 100, 40);
+        assert!(
+            !text.contains("PRESSURE CRITICAL"),
+            "no banner at level 2:\n{text}"
+        );
+        assert!(text.contains("PRESSURE warning (2)"), "{text}");
+    }
+
+    #[test]
+    fn missing_kernel_level_derives_the_alert_from_the_ratio() {
+        let mut critical = App::new(false, Duration::from_secs(2));
+        critical.apply_snapshot(snapshot_with_pressure(None, Some(0.87)));
+        let text = render_to_string(&critical, 100, 40);
+        assert!(
+            text.contains("PRESSURE CRITICAL"),
+            "the ratio drives the banner when the kernel is silent:\n{text}"
+        );
+        assert!(text.contains("PRESSURE critical 87%"), "{text}");
+
+        let mut warning = App::new(false, Duration::from_secs(2));
+        warning.apply_snapshot(snapshot_with_pressure(None, Some(0.75)));
+        let text = render_to_string(&warning, 100, 40);
+        assert!(!text.contains("PRESSURE CRITICAL"), "{text}");
+        assert!(text.contains("PRESSURE warning 75%"), "{text}");
+    }
+
+    #[test]
+    fn critical_pressure_is_red_and_bold_and_no_color_keeps_the_words() {
+        let mut app = App::new(false, Duration::from_secs(2));
+        app.apply_snapshot(snapshot_with_pressure(Some(4), Some(0.42)));
+        let buffer = render_buffer(&app, 100, 40);
+
+        let (x, y) = cell_at(&buffer, "PRESSURE CRITICAL").expect("header banner");
+        assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Red);
+        assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+
+        // The pressure row itself is red and bold, not only its value.
+        let (x, y) = cell_at(&buffer, "SYS CPU").expect("pressure row label");
+        assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Red);
+        assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+
+        // `--no-color` drops the styling but the words stay readable.
+        let mut mono = App::new(true, Duration::from_secs(2));
+        mono.apply_snapshot(snapshot_with_pressure(Some(4), Some(0.42)));
+        let lines = render_lines(&mono, 100, 40);
+        assert!(
+            lines[0].contains("PRESSURE CRITICAL"),
+            "banner without colour: {:?}",
+            lines[0]
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("PRESSURE critical (4)")));
+    }
+
+    #[test]
+    fn long_byte_counts_keep_the_gauge_inside_the_left_column() {
+        for (width, height) in [(100_u16, 30_u16), (80_u16, 24_u16)] {
+            let mut snapshot = synthetic_snapshot();
+            // A sub-gigabyte figure is six characters wide, which is what used
+            // to push the bars past a fixed `column_width - 34` assumption.
+            snapshot.models.memory_used_bytes = Some(275_300_000);
+            snapshot.models.memory_max_bytes = Some(10_600_000_000);
+            // A large footprint exercises the text-only rows too: at 80
+            // columns the trailing `app` figure no longer fits.
+            if let Some(server) = snapshot.processes.server.as_mut() {
+                server.footprint_bytes = Some(12_300_000_000);
+            }
+
+            let mut app = App::new(false, Duration::from_secs(2));
+            app.apply_snapshot(snapshot);
+            let buffer = render_buffer(&app, width, height);
+
+            let (vram_x, y) = cell_at(&buffer, "VRAM").expect("VRAM row");
+            assert_eq!(
+                vram_x,
+                width / 2,
+                "the right column starts at half the frame at {width} columns"
+            );
+            assert_eq!(
+                buffer[(vram_x - 1, y)].symbol(),
+                " ",
+                "one blank cell must separate the columns at {width} columns"
+            );
+
+            let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+            assert!(
+                row.contains("262.5M"),
+                "the sub-gigabyte figure is rendered at {width} columns: {row:?}"
+            );
+            assert!(
+                row.contains(']'),
+                "the gauge keeps its closing bracket at {width} columns: {row:?}"
+            );
+            for x in vram_x..width {
+                let symbol = buffer[(x, y)].symbol();
+                assert!(
+                    !matches!(symbol, "█" | "░" | "[" | "]"),
+                    "a left-column gauge glyph reached the right column at x={x} \
+                     on a {width}-column frame: {row:?}"
+                );
+            }
+        }
     }
 
     #[test]

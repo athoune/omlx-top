@@ -149,6 +149,12 @@ pub struct SocketProto {
 }
 
 /// `struct socket_info` from `sys/proc_info.h`.
+///
+/// This is the **prefix** of the SDK struct: `soi_proto` is a union whose
+/// largest member is `struct un_sockinfo` (528 bytes), while the only member
+/// decoded here is `pri_tcp` (120 bytes). The fields before the union are
+/// byte-for-byte identical to the SDK, so the offsets stay valid; see
+/// [`SocketFdInfo`] for why the total size is deliberately smaller.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SocketInfo {
@@ -174,13 +180,36 @@ pub struct SocketInfo {
     pub soi_proto: SocketProto,
 }
 
-/// `struct socket_fdinfo` from `sys/proc_info.h`.
+/// The readable prefix of `struct socket_fdinfo` (offsets and `pfi` layout
+/// match the SDK).
+///
+/// The SDK struct is 792 bytes on macOS 26: `soi_proto` is a union sized by
+/// `struct un_sockinfo` (528 bytes), not by `pri_tcp` (120 bytes) which is all
+/// this module decodes. Declaring every union member here would tie the file to
+/// each SDK revision for data we never read, so the struct stops after
+/// `pri_tcp`. The consequence is that `size_of::<SocketFdInfo>()` (384) is
+/// **not** the buffer length to hand to `proc_pidfdinfo`: the kernel rejects
+/// anything shorter than its own 792-byte struct with `ENOMEM`. See
+/// [`SOCKET_FDINFO_BUFFER`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SocketFdInfo {
     pub pfi: ProcFileInfo,
     pub psi: SocketInfo,
 }
+
+/// Scratch size for `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`.
+///
+/// The kernel requires a buffer at least as large as the SDK's
+/// `struct socket_fdinfo` (792 bytes today) and fails with `ENOMEM` otherwise;
+/// that size grows whenever the `soi_proto` union gains a member. 1024 bytes
+/// covers the current SDK with headroom, and only the leading
+/// `size_of::<SocketFdInfo>()` bytes are ever decoded.
+const SOCKET_FDINFO_BUFFER: usize = 1024;
+
+// Compile-time guard: the SDK struct is 792 bytes today, and a buffer shorter
+// than it makes `proc_pidfdinfo` fail with ENOMEM for every socket.
+const _: () = assert!(SOCKET_FDINFO_BUFFER >= 792);
 
 /// A decoded listening endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,22 +309,28 @@ pub fn list_listening_ports(pid: i32) -> Result<Vec<u16>, SysError> {
             continue;
         }
 
-        let mut socket_info = SocketFdInfo::default();
-        // SAFETY: `socket_info` is correctly sized and writable.
+        let mut raw = [0u8; SOCKET_FDINFO_BUFFER];
+        // SAFETY: `raw` is writable for its whole length and the kernel owns no
+        // reference to it after the call.
         let result = unsafe {
             proc_pidfdinfo(
                 pid,
                 fd_info.proc_fd,
                 PROC_PIDFDSOCKETINFO,
-                &mut socket_info as *mut _ as *mut libc::c_void,
-                size_of::<SocketFdInfo>() as libc::c_int,
+                raw.as_mut_ptr() as *mut libc::c_void,
+                SOCKET_FDINFO_BUFFER as libc::c_int,
             )
         };
-        // Descriptors can close between the list and the inspect call; a
-        // failure for one fd is not a failure for the process.
-        if result <= 0 {
+        // Descriptors can close between the list and the inspect call, and a
+        // buffer shorter than the kernel's struct fails with a negative errno;
+        // either way this fd is skipped, not the whole process. Requiring at
+        // least the prefix we decode also proves the copy below is in bounds.
+        if result < size_of::<SocketFdInfo>() as libc::c_int {
             continue;
         }
+        // SAFETY: the kernel wrote at least `size_of::<SocketFdInfo>()` bytes
+        // into `raw`, and `read_unaligned` tolerates any alignment.
+        let socket_info = unsafe { ptr::read_unaligned(raw.as_ptr() as *const SocketFdInfo) };
 
         if let Some(listen) = decode_socket_info(&socket_info) {
             if !ports.contains(&listen.port) {
@@ -311,6 +346,7 @@ pub fn list_listening_ports(pid: i32) -> Result<Vec<u16>, SysError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::offset_of;
     use std::slice;
 
     const TCP: i32 = SOCKINFO_TCP;
@@ -340,12 +376,21 @@ mod tests {
     }
 
     #[test]
-    fn field_layout_matches_the_sdk() {
+    fn decoded_prefix_matches_the_sdk_offsets() {
+        // The offsets we decode, not the total size, are the contract: the SDK
+        // struct is 792 bytes because `soi_proto` is a union sized by
+        // `un_sockinfo` (528), while this module only reads `pri_tcp`.
         assert_eq!(size_of::<VinfoStat>(), 136);
         assert_eq!(size_of::<InSockInfo>(), 80);
         assert_eq!(size_of::<TcpSockInfo>(), 120);
-        assert_eq!(size_of::<SocketInfo>(), 360);
-        assert_eq!(size_of::<SocketFdInfo>(), 384);
+        assert_eq!(offset_of!(SocketInfo, soi_kind), 232);
+        assert_eq!(offset_of!(SocketInfo, soi_proto), 240);
+        assert_eq!(offset_of!(SocketFdInfo, psi), 24);
+        assert!(
+            size_of::<SocketFdInfo>()
+                >= offset_of!(SocketInfo, soi_proto) + size_of::<TcpSockInfo>(),
+            "the truncated struct must cover the whole tcp_sockinfo it decodes"
+        );
     }
 
     #[test]

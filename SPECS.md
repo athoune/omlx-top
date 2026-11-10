@@ -431,6 +431,22 @@ They can disagree (the kernel level is sticky). When they do, show the kernel
 level as the authoritative badge and the ratio as context. Do not silently
 convert one into the other.
 
+Alert state, used for colour and for the header banner:
+
+| Condition | State |
+|---|---|
+| kernel level 4 | `critical` |
+| kernel level 2 | `warning` |
+| kernel level 1 | `normal` |
+| kernel unavailable, ratio ≥ 0.85 | `critical` |
+| kernel unavailable, ratio ≥ 0.70 | `warning` |
+| otherwise | `unknown` |
+
+At `critical`, the header appends `⚠ PRESSURE CRITICAL` (red, bold) and the
+pressure row is red and bold. `warning` colours the row only: a header banner
+for a state that lasts hours becomes wallpaper. No blinking and no animation —
+a TUI that redraws itself to flash burns CPU to convey nothing new.
+
 ## 6. Sampling
 
 ### 6.1 Cadence
@@ -672,7 +688,8 @@ Status badge states:
 ### 7.3 Colour and legibility
 
 - Green/yellow/red thresholds: CPU > 50/80 %, GPU > 50/80 %, model memory >
-  60/85 % of ceiling, system used > 70/85 %.
+  60/85 % of ceiling, system used > 70/85 %. Memory pressure uses the alert
+  table in §5.7, with `critical` also bold and announced in the header.
 - Never encode meaning by colour alone: every gauge shows its number, every
   badge shows its word.
 - Respect `NO_COLOR` (disable styling, keep layout) and `TERM=xterm-mono`.
