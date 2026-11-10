@@ -1,21 +1,28 @@
-//! One-shot snapshot assembly.
+//! Snapshot assembly and the interactive sampler thread.
 //!
-//! The interactive tick loop and its thread belong to a later batch. This
-//! module owns the reusable pieces they will need: persistent CPU samplers, a
-//! model cache with a 30 s TTL, and a single [`Sampler::sample_once`] that
-//! performs the HTTP calls and the OS reads in one pass.
+//! [`Sampler::sample_once`] performs the HTTP calls and the OS reads in one
+//! pass; `--once` and `--json` use it without spawning anything. The TUI uses
+//! [`spawn`], which owns one thread that waits on a [`Command`] channel with
+//! `recv_timeout(until_deadline)` and publishes [`Msg::Snapshot`] into the
+//! merged message channel (SPECS.md section 6.2, "Thread model").
 //!
 //! One-shot CPU measurement follows SPECS.md section 5.1: two `rusage`
 //! readings separated by `--warmup`, computed over that window. `--warmup 0`
-//! reports `null` rather than inventing a number.
+//! reports `null` rather than inventing a number. Tick sampling uses the
+//! interval between two ticks instead, through [`Sampler::measure_tick`].
 
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ratatui::crossterm::event::Event;
+
+use crate::config;
 use crate::http::endpoints::{HealthResponse, ModelEntry, ModelsResponse, StatusResponse};
 use crate::http::{self, Client, HttpError, HttpReply};
 use crate::model::{
-    Instance, Mode, ModelsBlock, Pressure, ProcessMetrics, ProcessesBlock, ServerBlock, Serving,
-    Snapshot, SystemBlock,
+    Instance, Mode, ModelRow, ModelsBlock, Pressure, ProcessMetrics, ProcessesBlock, ServerBlock,
+    Serving, Snapshot, SystemBlock,
 };
 use crate::sys;
 use crate::sys::info::MachTimebaseInfo;
@@ -25,6 +32,48 @@ use crate::sys::vm::SystemCpuSampler;
 /// `/v1/models/status` is refreshed at most once per 30 s (SPECS.md section
 /// 6.1). Expressed in nanoseconds to match [`Clock::monotonic_ns`].
 const MODELS_TTL_NS: u64 = 30 * 1_000_000_000;
+
+/// Discovery re-runs at this cadence in tick mode (SPECS.md section 6.1).
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// On a connection failure the tick loop backs off to this period while it
+/// keeps sampling OS counters (SPECS.md section 6.2).
+const FAILURE_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Messages published by the two producers and consumed by the UI thread.
+///
+/// The sampler sends [`Msg::Snapshot`]; the input thread sends [`Msg::Input`]
+/// into the same channel, so the UI has exactly one blocking `recv()`.
+#[derive(Debug)]
+pub enum Msg {
+    Snapshot(Box<Snapshot>),
+    Input(Event),
+}
+
+/// Commands from the UI to the sampler thread (SPECS.md section 6.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    Pause,
+    Resume,
+    SetInterval(Duration),
+    /// Re-run discovery, keep the current port when it still exists, sample.
+    RefreshNow,
+    /// Fetch `/v1/models/status` immediately, then sample.
+    RefreshModels,
+    Retarget(Instance),
+    Stop,
+}
+
+/// Everything the sampler thread needs to start and to rediscover.
+#[derive(Debug, Clone)]
+pub struct ThreadConfig {
+    pub instances: Vec<Instance>,
+    pub target_url: String,
+    pub interval: Duration,
+    pub api_key: Option<String>,
+    pub cli_url: Option<String>,
+    pub settings_port: Option<u16>,
+}
 
 /// Time source, injectable so tests never sleep.
 pub trait Clock: Send + Sync {
@@ -88,11 +137,14 @@ struct ModelsCache {
 /// Stateful sampler shared by one-shot mode and (later) the tick loop.
 pub struct Sampler {
     client: Client,
+    api_key: Option<String>,
     instances: Vec<Instance>,
     mode: Mode,
     server_pid: Option<i32>,
     gui_pid: Option<i32>,
     warmup: Duration,
+    /// Monotonic anchor of the tick sampler; `None` until the first tick.
+    tick_epoch_ns: Option<u64>,
     probes: Probes,
     server_cpu: CpuSampler,
     gui_cpu: CpuSampler,
@@ -124,12 +176,14 @@ impl Sampler {
         let gui_pid = selected.and_then(|instance| instance.gui_pid);
 
         Sampler {
-            client: Client::new(target_url.to_string(), api_key),
+            client: Client::new(target_url.to_string(), api_key.clone()),
+            api_key,
             instances,
             mode,
             server_pid,
             gui_pid,
             warmup,
+            tick_epoch_ns: None,
             probes,
             server_cpu: CpuSampler::default(),
             gui_cpu: CpuSampler::default(),
@@ -199,10 +253,109 @@ impl Sampler {
         }
     }
 
+    /// Measure CPU and footprint over the time since the previous tick.
+    ///
+    /// Unlike [`Sampler::measure_window`], this never sleeps: the window is
+    /// the sampler interval itself, which is what the TUI displays. The first
+    /// tick has no baseline and reports `null` CPU (SPECS.md section 5.1).
+    pub fn measure_tick(&mut self) -> WindowMetrics {
+        let now_ns = self.probes.clock.monotonic_ns();
+        let epoch_ns = *self.tick_epoch_ns.get_or_insert(now_ns);
+        let wall_ns = now_ns.saturating_sub(epoch_ns);
+
+        let server_usage = self
+            .server_pid
+            .and_then(|pid| (self.probes.read_usage)(pid));
+        let app_usage = self.gui_pid.and_then(|pid| (self.probes.read_usage)(pid));
+        let ticks = (self.probes.read_cpu_ticks)();
+
+        let server_cpu = push_tick(
+            &mut self.server_cpu,
+            server_usage,
+            wall_ns,
+            self.probes.timebase,
+        );
+        let app_cpu = push_tick(&mut self.gui_cpu, app_usage, wall_ns, self.probes.timebase);
+        let system_cpu_percent = ticks
+            .and_then(|ticks| self.system_cpu.push(ticks))
+            .filter(|_| wall_ns > 0);
+
+        WindowMetrics {
+            server: process_with_reading(self.server_pid, server_cpu, server_usage),
+            app: process_with_reading(self.gui_pid, app_cpu, app_usage),
+            system_cpu_percent,
+        }
+    }
+
+    /// Drop the CPU baselines so the next tick reports `null` again instead of
+    /// averaging over a pause or an instance switch.
+    pub fn reset_counters(&mut self) {
+        self.server_cpu.reset();
+        self.gui_cpu.reset();
+        self.system_cpu.reset();
+        self.tick_epoch_ns = None;
+    }
+
+    /// Force the next `models_document` call to hit the network.
+    pub fn invalidate_models(&mut self) {
+        self.models_cache = None;
+    }
+
+    /// The discovered list the sampler is currently working from.
+    pub fn instances(&self) -> &[Instance] {
+        &self.instances
+    }
+
+    /// Switch the target instance, keeping the discovered list in sync.
+    pub fn retarget(&mut self, target: &Instance) {
+        let instances = self.instances.clone();
+        self.adopt_discovery(instances, target);
+    }
+
+    /// Replace the discovered list and bind the HTTP client to `target`.
+    ///
+    /// The periodic rediscovery calls this every 30 s with the same target;
+    /// keeping the CPU baselines and the model cache in that case avoids a
+    /// spurious `—` CPU every 30 s and an unnecessary 15 KB fetch.
+    pub fn adopt_discovery(&mut self, instances: Vec<Instance>, target: &Instance) {
+        let mut instances = instances;
+        for instance in &mut instances {
+            instance.selected = instance.pid == target.pid && instance.port == target.port;
+        }
+
+        let url = target
+            .url
+            .clone()
+            .or_else(|| target.port.map(config::canonical_url))
+            .unwrap_or_else(|| self.client.base_url().to_string());
+        let same_target =
+            self.server_pid == Some(target.pid) && self.client.base_url() == url.as_str();
+
+        self.client = Client::new(url, self.api_key.clone());
+        self.mode = target.mode;
+        self.server_pid = Some(target.pid);
+        self.gui_pid = target.gui_pid;
+        self.instances = instances;
+
+        if !same_target {
+            self.models_cache = None;
+            self.reset_counters();
+        }
+    }
+
     /// Assemble one complete snapshot: HTTP first, then the OS counters.
     pub fn sample_once(&mut self) -> Snapshot {
         let window = self.measure_window();
+        self.sample_with(window)
+    }
 
+    /// Assemble one tick-mode snapshot: the CPU window is the sampler interval.
+    pub fn sample_tick(&mut self) -> Snapshot {
+        let window = self.measure_tick();
+        self.sample_with(window)
+    }
+
+    fn sample_with(&mut self, window: WindowMetrics) -> Snapshot {
         let mut snapshot = Snapshot {
             timestamp_unix_ms: unix_ms(),
             server: ServerBlock {
@@ -221,6 +374,7 @@ impl Sampler {
             },
             system: self.sample_system(window.system_cpu_percent),
             gpu: sys::gpu::sample(),
+            model_rows: Vec::new(),
         };
 
         // Primary request. A transport failure or a 503 triggers the /health
@@ -241,6 +395,13 @@ impl Sampler {
         let api_reachable = api.is_ok();
         let health_reachable = health.as_ref().is_some_and(|reply| reply.is_ok());
         snapshot.server.reachable = api_reachable || health_reachable;
+
+        // A transport failure is not proof that the server is down: a model
+        // load or a heavy prefill holds the Python event loop past the 1 s
+        // timeout while the process is alive (SPECS.md sections 6.2 and 7.2).
+        if !snapshot.server.reachable {
+            snapshot.server.pid_alive = self.server_pid.map(sys::proc::pid_alive);
+        }
 
         let api_status = api.as_ref().ok().map(|reply| reply.http_status);
         let health_status = health
@@ -285,6 +446,7 @@ impl Sampler {
         let expected_loaded_count = api_body.and_then(|body| body.models_loaded);
         let models_body = self.models_document(models_allowed, expected_loaded_count);
         snapshot.models = build_models(api_body, health_body, models_body.as_ref());
+        snapshot.model_rows = model_rows(models_body.as_ref());
 
         snapshot
     }
@@ -365,6 +527,218 @@ impl Sampler {
     }
 }
 
+/// Spawn the sampler thread and return the command sender.
+///
+/// The thread publishes one snapshot immediately, then one per interval. It
+/// blocks on `recv_timeout(until_deadline)` so commands take effect at once
+/// without any polling. The UI owns both ends of `messages`; this function
+/// only borrows a clone for the sampler half.
+pub fn spawn(config: ThreadConfig, messages: Sender<Msg>) -> std::io::Result<Sender<Command>> {
+    let (commands_tx, commands_rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("sampler".to_string())
+        .spawn(move || run(config, messages, commands_rx))?;
+    Ok(commands_tx)
+}
+
+struct RunState {
+    sampler: Sampler,
+    config: ThreadConfig,
+    interval: Duration,
+    paused: bool,
+}
+
+impl RunState {
+    fn new(config: ThreadConfig) -> Self {
+        let sampler = Sampler::new(
+            config.instances.clone(),
+            &config.target_url,
+            Duration::ZERO,
+            config.api_key.clone(),
+        );
+        let interval = config.interval;
+        RunState {
+            sampler,
+            config,
+            interval,
+            paused: false,
+        }
+    }
+
+    /// Publish one snapshot and report whether the server answered.
+    fn publish(&mut self, messages: &Sender<Msg>) -> bool {
+        let snapshot = self.sampler.sample_tick();
+        let reachable = snapshot.server.reachable;
+        if messages.send(Msg::Snapshot(Box::new(snapshot))).is_err() {
+            // The UI is gone; the next command read will disconnect too.
+        }
+        reachable
+    }
+
+    /// Re-run discovery, keeping `keep_port` when it still listens.
+    fn rediscover(&mut self, keep_port: Option<u16>) {
+        if let Some((instances, target)) = discover_instances(&self.config, keep_port) {
+            self.sampler.adopt_discovery(instances, &target);
+        }
+    }
+
+    fn current_port(&self) -> Option<u16> {
+        self.sampler
+            .instances()
+            .iter()
+            .find(|instance| instance.selected)
+            .and_then(|instance| instance.port)
+    }
+}
+
+fn run(config: ThreadConfig, messages: Sender<Msg>, commands: Receiver<Command>) {
+    let mut state = RunState::new(config);
+    let mut last_discovery = Instant::now();
+    let mut reachable = state.publish(&messages);
+    let mut deadline = Instant::now() + next_delay(state.interval, reachable);
+
+    loop {
+        if state.paused {
+            match commands.recv() {
+                Ok(command) => {
+                    let refreshed = matches!(&command, Command::RefreshNow);
+                    if !apply_command(
+                        &mut state,
+                        &messages,
+                        command,
+                        &mut deadline,
+                        &mut reachable,
+                    ) {
+                        return;
+                    }
+                    if refreshed {
+                        last_discovery = Instant::now();
+                    }
+                }
+                Err(_) => return,
+            }
+            continue;
+        }
+
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match commands.recv_timeout(wait) {
+            Ok(command) => {
+                let refreshed = matches!(&command, Command::RefreshNow);
+                if !apply_command(
+                    &mut state,
+                    &messages,
+                    command,
+                    &mut deadline,
+                    &mut reachable,
+                ) {
+                    return;
+                }
+                if refreshed {
+                    last_discovery = Instant::now();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if last_discovery.elapsed() >= DISCOVERY_INTERVAL {
+                    let keep_port = state.current_port();
+                    state.rediscover(keep_port);
+                    last_discovery = Instant::now();
+                }
+
+                let tick_started = Instant::now();
+                reachable = state.publish(&messages);
+                deadline = tick_started + next_delay(state.interval, reachable);
+                // A tick that overran its own interval is skipped, never
+                // queued (SPECS.md section 6.2).
+                if deadline <= Instant::now() {
+                    deadline = Instant::now() + next_delay(state.interval, reachable);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// Apply one command. Returns `false` when the thread must stop.
+fn apply_command(
+    state: &mut RunState,
+    messages: &Sender<Msg>,
+    command: Command,
+    deadline: &mut Instant,
+    reachable: &mut bool,
+) -> bool {
+    match command {
+        Command::Stop => return false,
+        Command::Pause => state.paused = true,
+        Command::Resume => {
+            if state.paused {
+                state.paused = false;
+                state.sampler.reset_counters();
+                *reachable = state.publish(messages);
+                *deadline = Instant::now() + next_delay(state.interval, *reachable);
+            }
+        }
+        Command::SetInterval(interval) => {
+            state.interval = interval;
+            *deadline = Instant::now() + next_delay(interval, *reachable);
+        }
+        Command::RefreshNow => {
+            let keep_port = state.current_port();
+            state.rediscover(keep_port);
+            *reachable = state.publish(messages);
+            *deadline = Instant::now() + next_delay(state.interval, *reachable);
+        }
+        Command::RefreshModels => {
+            state.sampler.invalidate_models();
+            *reachable = state.publish(messages);
+            *deadline = Instant::now() + next_delay(state.interval, *reachable);
+        }
+        Command::Retarget(instance) => {
+            state.sampler.retarget(&instance);
+            *reachable = state.publish(messages);
+            *deadline = Instant::now() + next_delay(state.interval, *reachable);
+        }
+    }
+    true
+}
+
+/// The wait before the next tick: the interval, or a 5 s backoff while the
+/// server is unreachable (SPECS.md section 6.2).
+fn next_delay(interval: Duration, reachable: bool) -> Duration {
+    if reachable {
+        interval
+    } else {
+        interval.max(FAILURE_BACKOFF)
+    }
+}
+
+/// Discover instances and pick the target: `keep_port` when it still listens,
+/// otherwise the first (lowest-port) instance.
+fn discover_instances(
+    config: &ThreadConfig,
+    keep_port: Option<u16>,
+) -> Option<(Vec<Instance>, Instance)> {
+    let candidates = sys::discover::discover().ok()?;
+    let mut probe = |port: u16| http::Client::new(config::canonical_url(port), None).probe();
+    let instances = sys::discover::build_instances(
+        &candidates,
+        config.cli_url.as_deref(),
+        config.settings_port,
+        &mut probe,
+    )
+    .ok()?;
+
+    let target = keep_port
+        .and_then(|port| {
+            instances
+                .iter()
+                .find(|instance| instance.port == Some(port))
+        })
+        .or_else(|| instances.first())?
+        .clone();
+
+    Some((instances, target))
+}
+
 fn process_metrics(pid: i32, cpu_percent: Option<f64>, usage: RawUsage) -> ProcessMetrics {
     ProcessMetrics {
         pid,
@@ -411,6 +785,24 @@ fn cpu_delta(
             ticks: after.ticks,
             start_abstime: after.start_abstime,
             wall_ns: window_ns,
+        },
+        timebase,
+    )
+}
+
+/// Feed one tick reading into a CPU sampler using cumulative wall time.
+fn push_tick(
+    sampler: &mut CpuSampler,
+    usage: Option<RawUsage>,
+    wall_ns: u64,
+    timebase: MachTimebaseInfo,
+) -> Option<f64> {
+    let usage = usage?;
+    sampler.push(
+        CpuSample {
+            ticks: usage.ticks,
+            start_abstime: usage.start_abstime,
+            wall_ns,
         },
         timebase,
     )
@@ -475,6 +867,34 @@ fn loaded_ids(entries: &[&ModelEntry]) -> Vec<String> {
         .iter()
         .filter(|entry| entry.loaded == Some(true))
         .filter_map(|entry| entry.id.clone())
+        .collect()
+}
+
+/// Turn the raw `/v1/models/status` array into table rows.
+///
+/// Built-ins stay in the list with `builtin: true`; the table filters them at
+/// render time (SPECS.md section 2.3).
+pub fn model_rows(models: Option<&ModelsResponse>) -> Vec<ModelRow> {
+    let Some(entries) = models.and_then(|models| models.models.as_deref()) else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.id.clone()?;
+            Some(ModelRow {
+                id,
+                loaded: entry.loaded == Some(true),
+                is_loading: entry.is_loading == Some(true),
+                engine_type: entry.engine_type.clone(),
+                model_type: entry.model_type.clone(),
+                context_window: entry.max_context_window.or(entry.model_context_length),
+                estimated_size: entry.estimated_size.or(entry.resident_estimated_size),
+                actual_size: entry.actual_size,
+                builtin: is_builtin(entry),
+            })
+        })
         .collect()
 }
 
@@ -716,6 +1136,70 @@ mod tests {
         assert_eq!(window.system_cpu_percent, Some(75.0));
         assert_eq!(clock.sleeps.load(Ordering::SeqCst), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn tick_mode_uses_the_interval_and_never_sleeps() {
+        let clock = Arc::new(FakeClock::default());
+        let (mut sampler, calls) = sampler_with_clock(Arc::clone(&clock), Duration::ZERO);
+
+        let first = sampler.measure_tick();
+        assert_eq!(first.server.expect("footprint").cpu_percent, None);
+        assert_eq!(clock.sleeps.load(Ordering::SeqCst), 0, "ticks never sleep");
+
+        clock.now.store(2_000_000_000, Ordering::SeqCst);
+        let second = sampler.measure_tick();
+        assert!(
+            second
+                .server
+                .expect("process sampled")
+                .cpu_percent
+                .is_some(),
+            "the second tick has a baseline"
+        );
+        assert_eq!(clock.sleeps.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn retargeting_resets_the_cpu_baseline() {
+        let clock = Arc::new(FakeClock::default());
+        let (mut sampler, _) = sampler_with_clock(Arc::clone(&clock), Duration::ZERO);
+        sampler.measure_tick();
+        clock.now.store(2_000_000_000, Ordering::SeqCst);
+        assert!(sampler.measure_tick().server.is_some());
+
+        let mut other = instance();
+        other.port = Some(8000);
+        other.url = Some("http://127.0.0.1:8000".to_string());
+        sampler.retarget(&other);
+        let after = sampler.measure_tick();
+        assert_eq!(
+            after.server.expect("footprint").cpu_percent,
+            None,
+            "a new target starts a new baseline"
+        );
+    }
+
+    #[test]
+    fn model_rows_mark_the_builtin_and_keep_every_field_the_table_needs() {
+        let models: ModelsResponse =
+            serde_json::from_str(include_str!("../../tests/golden/models.json"))
+                .expect("golden models parse");
+        let rows = model_rows(Some(&models));
+
+        assert_eq!(rows.len(), 20, "the raw endpoint lists every engine");
+        assert_eq!(rows.iter().filter(|row| row.builtin).count(), 1);
+        assert!(rows
+            .iter()
+            .any(|row| row.id == "MarkItDown" && row.builtin && row.loaded));
+
+        let real = rows.iter().find(|row| !row.builtin).expect("a real model");
+        assert!(!real.loaded);
+        assert!(real.context_window.is_some());
+        assert!(real.estimated_size.is_some());
+
+        assert!(model_rows(None).is_empty());
     }
 
     #[test]

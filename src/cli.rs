@@ -1,13 +1,19 @@
 //! Command-line surface.
 //!
-//! Every option from SPECS.md section 8 is declared so the parser never rejects
-//! a documented flag. Options that belong to later batches are accepted and
-//! turned into an explicit "not implemented in this build" error by
-//! [`Cli::unimplemented_flag`].
+//! Every option from SPECS.md section 8 is implemented: the TUI is the bare
+//! invocation, `--once`/`--json`/`--list` are the scriptable modes, and
+//! `--no-color` disables styling.
 
 use std::time::Duration;
 
 use clap::Parser;
+
+/// Default sampling period (SPECS.md sections 6.1 and 8).
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Accepted `--interval` range. Values outside are clamped with a warning.
+pub const MIN_INTERVAL: Duration = Duration::from_millis(500);
+pub const MAX_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -46,30 +52,31 @@ pub struct Cli {
     #[arg(long)]
     pub list: bool,
 
-    /// Probe /admin/api/stats even without prior success
-    #[arg(long)]
-    pub admin: bool,
-
     /// Disable styling
     #[arg(long = "no-color")]
     pub no_color: bool,
 }
 
 impl Cli {
-    /// Return the first option that is declared but not implemented yet.
-    ///
-    /// `--url`, `--api-key`, `--once`, `--json` and `--warmup` are implemented
-    /// in this batch. `--interval` is parsed and accepted but only used by the
-    /// TUI, which is still rejected separately.
-    pub fn unimplemented_flag(&self) -> Option<&'static str> {
-        if self.admin {
-            Some("--admin")
-        } else if self.no_color {
-            Some("--no-color")
-        } else {
-            None
-        }
+    /// Bearer token from the flag or the documented environment variable.
+    pub fn api_key(&self) -> Option<String> {
+        self.api_key
+            .clone()
+            .or_else(|| std::env::var("OMLX_API_KEY").ok())
     }
+
+    /// Whether colour must be disabled by the flag, `NO_COLOR` or a mono
+    /// terminal (SPECS.md section 7.3).
+    pub fn color_disabled(&self) -> bool {
+        self.no_color
+            || std::env::var_os("NO_COLOR").is_some()
+            || std::env::var("TERM").is_ok_and(|term| term == "xterm-mono")
+    }
+}
+
+/// Clamp a sampling interval to the documented 500 ms – 60 s range.
+pub fn clamp_interval(duration: Duration) -> Duration {
+    duration.clamp(MIN_INTERVAL, MAX_INTERVAL)
 }
 
 /// Parse the duration syntax documented in SPECS.md section 8: `250ms`, `2s`
@@ -104,6 +111,15 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
     }
 }
 
+/// Parse `--interval`, applying the documented clamp.
+pub fn parse_interval(text: Option<&str>) -> Result<Duration, String> {
+    let raw = match text {
+        Some(text) => parse_duration(text)?,
+        None => DEFAULT_INTERVAL,
+    };
+    Ok(clamp_interval(raw))
+}
+
 enum DurationUnit {
     Millis,
     Seconds,
@@ -130,5 +146,26 @@ mod tests {
         assert!(parse_duration("-1s").is_err());
         assert!(parse_duration("1.5s").is_err());
         assert!(parse_duration("ms").is_err());
+    }
+
+    #[test]
+    fn interval_is_clamped_to_the_documented_range() {
+        assert_eq!(
+            parse_interval(None).expect("default"),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            parse_interval(Some("100ms")).expect("clamped"),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse_interval(Some("120s")).expect("clamped"),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_interval(Some("1500ms")).expect("inside"),
+            Duration::from_millis(1500)
+        );
+        assert!(parse_interval(Some("fast")).is_err());
     }
 }

@@ -1,4 +1,4 @@
-//! Data types shared by discovery, sampling and (in later batches) the UI.
+//! Data types shared by discovery, sampling and the UI.
 //!
 //! The JSON shape follows SPECS.md section 8.1 field by field. Every value that
 //! can be unavailable is an `Option`, so a missing key serialises as `null`
@@ -63,7 +63,7 @@ pub struct ProcessMetrics {
 ///
 /// Serialises as `system.memory` in the section 8.1 schema. The two derived
 /// values that the schema does not expose (`app_memory_bytes` and
-/// `uncompressed_bytes`) stay available for the TUI in later batches.
+/// `uncompressed_bytes`) stay available for the TUI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VmMetrics {
     pub total_bytes: u64,
@@ -113,6 +113,14 @@ pub struct ServerBlock {
     pub version: Option<String>,
     pub uptime_seconds: Option<f64>,
     pub last_latency_ms: Option<u64>,
+    /// Whether the discovered server pid still exists, checked with
+    /// `kill(pid, 0)` when a poll fails at the transport level.
+    ///
+    /// TUI-only: SPECS.md section 7.2 uses it to distinguish `unresponsive`
+    /// (alive but blocked) from `unreachable` (gone). It is skipped by serde,
+    /// so the section 8.1 JSON contract is unchanged.
+    #[serde(skip)]
+    pub pid_alive: Option<bool>,
 }
 
 impl Default for ServerBlock {
@@ -128,6 +136,7 @@ impl Default for ServerBlock {
             version: None,
             uptime_seconds: None,
             last_latency_ms: None,
+            pid_alive: None,
         }
     }
 }
@@ -160,6 +169,30 @@ pub struct ModelsBlock {
     /// `None` means the source carried no ids (the `/health` last resort or no
     /// source at all). SPECS.md section 8.1 requires that distinction.
     pub loaded: Option<Vec<String>>,
+}
+
+/// One row of the models table (SPECS.md section 7.5).
+///
+/// `models.loaded` stays the frozen JSON contract (section 8.1); these rows are
+/// delivered alongside the snapshot for the TUI only, so they are skipped by
+/// serde and never appear in `--json` output.
+///
+/// Built-in engines are included here with `builtin: true` so the table can
+/// honour section 2.3's exclusion rule at render time without losing the
+/// information that the server reported them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelRow {
+    pub id: String,
+    pub loaded: bool,
+    pub is_loading: bool,
+    pub engine_type: Option<String>,
+    pub model_type: Option<String>,
+    pub context_window: Option<u64>,
+    /// Server estimate; the table uses it when no actual size is reported.
+    pub estimated_size: Option<u64>,
+    /// Actual size when the server reports one.
+    pub actual_size: Option<u64>,
+    pub builtin: bool,
 }
 
 /// The `processes` block. `app` is `None` in service/manual mode.
@@ -202,6 +235,9 @@ pub struct Snapshot {
     pub processes: ProcessesBlock,
     pub system: SystemBlock,
     pub gpu: Option<GpuBlock>,
+    /// Per-model rows for the TUI table. Not part of the JSON contract.
+    #[serde(skip)]
+    pub model_rows: Vec<ModelRow>,
 }
 
 #[cfg(test)]
@@ -233,6 +269,7 @@ mod tests {
                 version: Some("0.7.3".to_string()),
                 uptime_seconds: Some(72_645.9),
                 last_latency_ms: Some(3),
+                pid_alive: None,
             },
             instances: vec![Instance {
                 mode: Mode::App,
@@ -302,6 +339,7 @@ mod tests {
                 in_use_bytes: Some(1_176_158_208),
                 alloc_bytes: Some(7_001_751_552),
             }),
+            model_rows: Vec::new(),
         }
     }
 
@@ -310,6 +348,10 @@ mod tests {
         let snapshot = sample_snapshot();
         let text = serde_json::to_string(&snapshot).expect("serialisable");
         assert!(!text.contains('\n'), "must stay on one line");
+        assert!(
+            !text.contains("model_rows"),
+            "the TUI-only rows must stay out of --json"
+        );
 
         let value: Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(

@@ -68,6 +68,79 @@ pub fn ratio_percent(ratio: f64) -> String {
     percent(ratio * 100.0)
 }
 
+/// Truncate a model id to `width` characters, keeping both ends.
+///
+/// Model ids carry their distinguishing part at the end
+/// (`nomicai-modernbert-…-8bit`), so a plain suffix cut would hide it. The
+/// ellipsis is a single character; `width` counts characters, not bytes.
+pub fn truncate_id(id: &str, width: usize) -> String {
+    let length = id.chars().count();
+    if length <= width {
+        return id.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+
+    let remaining = width - 1;
+    let tail = remaining / 2;
+    let head = remaining - tail;
+    let start: String = id.chars().take(head).collect();
+    let end: String = id.chars().skip(length - tail).collect();
+    format!("{start}…{end}")
+}
+
+/// Cut `text` to `width` characters with a trailing ellipsis. Used for short
+/// descriptive columns (`audio_tts`), where the beginning is the meaningful
+/// part, unlike model ids.
+pub fn truncate_end(text: &str, width: usize) -> String {
+    let length = text.chars().count();
+    if length <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let head: String = text.chars().take(width - 1).collect();
+    format!("{head}…")
+}
+
+/// Whether [`truncate_id`] would change `id` at this width.
+pub fn is_truncated(id: &str, width: usize) -> bool {
+    id.chars().count() > width
+}
+
+/// Format a token count in the compact `262k` / `1.0M` form used by the
+/// models table. Decimal units match the server's own display.
+pub fn context(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Group a count with commas, as in the serving block (`506,739`).
+pub fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Format a token throughput value. Uses decimal (1000-based) units, matching
 /// the `15.6k tok/s` example in SPECS.md section 11.
 pub fn throughput(value: f64) -> String {
@@ -150,6 +223,48 @@ mod tests {
         assert_eq!(percent(100.0), "100%");
         assert_eq!(ratio_percent(0.78), "78%");
         assert_eq!(percent(f64::NAN), "-");
+    }
+
+    #[test]
+    fn id_truncation_keeps_both_ends() {
+        assert_eq!(
+            truncate_id("nomicai-modernbert-8bit", 27),
+            "nomicai-modernbert-8bit"
+        );
+        assert_eq!(
+            truncate_id("nomicai-modernbert-instruct-8bit", 20),
+            "nomicai-mo…ruct-8bit"
+        );
+        assert_eq!(truncate_id("abc", 0), "");
+        assert_eq!(truncate_id("abc", 1), "…");
+        assert_eq!(truncate_id("abcdef", 5), "ab…ef");
+
+        assert!(is_truncated("nomicai-modernbert-instruct-8bit", 20));
+        assert!(!is_truncated("abc", 3));
+    }
+
+    #[test]
+    fn end_truncation_keeps_the_prefix() {
+        assert_eq!(truncate_end("embedding", 10), "embedding");
+        assert_eq!(truncate_end("audio_tts", 9), "audio_tts");
+        assert_eq!(truncate_end("audio_tts", 6), "audio…");
+        assert_eq!(truncate_end("abc", 0), "");
+        assert_eq!(truncate_end("abc", 1), "…");
+    }
+
+    #[test]
+    fn context_and_counts() {
+        assert_eq!(context(262_144), "262k");
+        assert_eq!(context(8192), "8k");
+        assert_eq!(context(512), "512");
+        assert_eq!(context(1_048_576), "1.0M");
+        assert_eq!(context(0), "0");
+
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(506_739), "506,739");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 
     #[test]

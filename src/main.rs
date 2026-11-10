@@ -1,8 +1,8 @@
 //! omlx-top entry point.
 //!
-//! Batch 2 implements the HTTP client, one-shot sampling and the `--once` /
-//! `--json` outputs. `--list` keeps its batch 1 behaviour. The TUI and
-//! `--admin` are still rejected with exit code 2.
+//! Bare invocation starts the interactive TUI. `--list`, `--once` and `--json`
+//! keep their scriptable behaviour; the TUI shares the same discovery and
+//! sampling code as the one-shot path.
 
 #[cfg(not(target_os = "macos"))]
 compile_error!("omlx-top currently supports macOS only");
@@ -14,35 +14,29 @@ pub mod http;
 pub mod model;
 pub mod sampler;
 pub mod sys;
+pub mod ui;
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
-use model::Snapshot;
+use model::{Instance, Snapshot};
 
 fn main() -> ExitCode {
     let cli = cli::Cli::parse();
-
-    if let Some(flag) = cli.unimplemented_flag() {
-        eprintln!("omlx-top: {flag} is not implemented in this build");
-        return ExitCode::from(2);
-    }
 
     if cli.list {
         list(&cli)
     } else if cli.json || cli.once {
         one_shot(&cli, cli.json)
     } else {
-        eprintln!(
-            "omlx-top: the TUI is not implemented in this build; use --list, --once or --json"
-        );
-        ExitCode::from(2)
+        tui(&cli)
     }
 }
 
 fn list(cli: &cli::Cli) -> ExitCode {
-    // Machine facts are read once at startup, like the sampler needs in later
-    // batches. `--list` itself does not depend on them.
+    // Machine facts are read once at startup, like the sampler needs them.
+    // `--list` itself does not depend on them.
     if let Err(error) = sys::info::init() {
         eprintln!("omlx-top: warning: machine info unavailable: {error}");
     }
@@ -97,24 +91,20 @@ fn list(cli: &cli::Cli) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn one_shot(cli: &cli::Cli, json: bool) -> ExitCode {
-    let warmup = match cli::parse_duration(&cli.warmup) {
-        Ok(warmup) => warmup,
-        Err(error) => {
-            eprintln!("omlx-top: {error}");
-            return ExitCode::from(2);
-        }
-    };
+/// The target the monitor measures: the discovered instances plus the base URL
+/// resolved from `--url`, the selected instance, or the documented default.
+struct Target {
+    instances: Vec<Instance>,
+    target_url: String,
+    settings_port: Option<u16>,
+}
 
-    if let Err(error) = sys::info::init() {
-        eprintln!("omlx-top: warning: machine info unavailable: {error}");
-    }
-
+fn resolve_target(cli: &cli::Cli) -> Result<Target, String> {
     let settings_port = config::load_settings_port();
     let mut probe = |port: u16| http::Client::new(config::canonical_url(port), None).probe();
 
-    // Discovery failure is not fatal for one-shot mode: an explicit --url (or
-    // the documented default) can still be probed without a process table.
+    // Discovery failure is not fatal: an explicit --url (or the documented
+    // default) can still be probed without a process table.
     let candidates = match sys::discover::discover() {
         Ok(candidates) => candidates,
         Err(error) => {
@@ -123,18 +113,9 @@ fn one_shot(cli: &cli::Cli, json: bool) -> ExitCode {
         }
     };
 
-    let instances = match sys::discover::build_instances(
-        &candidates,
-        cli.url.as_deref(),
-        settings_port,
-        &mut probe,
-    ) {
-        Ok(instances) => instances,
-        Err(error) => {
-            eprintln!("omlx-top: {error}");
-            return ExitCode::from(2);
-        }
-    };
+    let instances =
+        sys::discover::build_instances(&candidates, cli.url.as_deref(), settings_port, &mut probe)
+            .map_err(|error| error.to_string())?;
 
     let target_url = cli
         .url
@@ -148,12 +129,37 @@ fn one_shot(cli: &cli::Cli, json: bool) -> ExitCode {
         .or_else(|| settings_port.map(config::canonical_url))
         .unwrap_or_else(|| config::canonical_url(8000));
 
-    let api_key = cli
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("OMLX_API_KEY").ok());
+    Ok(Target {
+        instances,
+        target_url,
+        settings_port,
+    })
+}
 
-    let mut sampler = sampler::Sampler::new(instances, &target_url, warmup, api_key);
+fn one_shot(cli: &cli::Cli, json: bool) -> ExitCode {
+    let warmup = match cli::parse_duration(&cli.warmup) {
+        Ok(warmup) => warmup,
+        Err(error) => {
+            eprintln!("omlx-top: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if let Err(error) = sys::info::init() {
+        eprintln!("omlx-top: warning: machine info unavailable: {error}");
+    }
+
+    let target = match resolve_target(cli) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("omlx-top: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // One-shot mode never spawns the sampler thread.
+    let mut sampler =
+        sampler::Sampler::new(target.instances, &target.target_url, warmup, cli.api_key());
     let snapshot = sampler.sample_once();
 
     if json {
@@ -172,6 +178,64 @@ fn one_shot(cli: &cli::Cli, json: bool) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+fn tui(cli: &cli::Cli) -> ExitCode {
+    let interval = match cli::parse_interval(cli.interval.as_deref()) {
+        Ok(interval) => interval,
+        Err(error) => {
+            eprintln!("omlx-top: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(raw) = cli.interval.as_deref() {
+        if let Ok(parsed) = cli::parse_duration(raw) {
+            if cli::clamp_interval(parsed) != parsed {
+                eprintln!(
+                    "omlx-top: warning: --interval clamped to {}",
+                    describe_duration(interval)
+                );
+            }
+        }
+    }
+
+    if let Err(error) = sys::info::init() {
+        eprintln!("omlx-top: warning: machine info unavailable: {error}");
+    }
+
+    let target = match resolve_target(cli) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("omlx-top: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let options = ui::RunOptions {
+        instances: target.instances,
+        target_url: target.target_url,
+        interval,
+        api_key: cli.api_key(),
+        cli_url: cli.url.clone(),
+        settings_port: target.settings_port,
+        no_color: cli.color_disabled(),
+    };
+
+    match ui::run(options) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("omlx-top: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn describe_duration(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format::duration(duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
     }
 }
 

@@ -109,6 +109,11 @@ pub struct CpuSampler {
 }
 
 impl CpuSampler {
+    /// Forget the baseline, so the next push reports `None`.
+    pub fn reset(&mut self) {
+        self.previous = None;
+    }
+
     pub fn push(&mut self, sample: CpuSample, timebase: MachTimebaseInfo) -> Option<f64> {
         let previous = self.previous.replace(sample)?;
 
@@ -242,6 +247,27 @@ pub fn parent_pid(pid: i32) -> Result<i32, SysError> {
 pub fn owner_uid(pid: i32) -> Result<u32, SysError> {
     let info = bsd_info(pid)?;
     Ok(info.pbi_uid)
+}
+
+/// Whether a process still exists, without sending it a real signal.
+///
+/// `kill(pid, 0)` performs the permission and existence checks only: success
+/// or `EPERM` (the process exists but belongs to another user) means alive,
+/// `ESRCH` means gone. Non-positive pids are never passed to the kernel —
+/// signal 0 to `0` or `-1` would address a process group.
+pub fn pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: `kill` with signal 0 has no side effect on the target process.
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    )
 }
 
 /// Read `rusage_info_v0` for a process.
@@ -475,6 +501,17 @@ mod tests {
         let mut sampler = CpuSampler::default();
         assert_eq!(sampler.push(sample(100, 7, 1_000), TB), None);
         assert_eq!(sampler.push(sample(200, 7, 1_000), TB), None);
+    }
+
+    #[test]
+    fn pid_liveness_uses_a_zero_signal() {
+        // Our own pid is alive; no real signal is delivered.
+        assert!(pid_alive(std::process::id() as i32));
+        // Non-positive values address process groups and are refused.
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-1));
+        // Above the kernel pid limit: guaranteed ESRCH.
+        assert!(!pid_alive(2_000_000_000));
     }
 
     #[test]

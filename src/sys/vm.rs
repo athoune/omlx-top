@@ -243,6 +243,11 @@ pub struct SystemCpuSampler {
 }
 
 impl SystemCpuSampler {
+    /// Forget the baseline, so the next push reports `None`.
+    pub fn reset(&mut self) {
+        self.previous = None;
+    }
+
     pub fn push(&mut self, ticks: [u32; 4]) -> Option<f64> {
         let previous = self.previous.replace(ticks)?;
 

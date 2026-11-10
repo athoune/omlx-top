@@ -115,7 +115,7 @@ actually listening on (§6.3).
 | `GET /api/status` | 822 B | ~3 ms | none when bound to loopback | low | primary source, every tick |
 | `GET /health` | 178 B | ~2.7 ms | none | low | liveness / "loading" discriminator |
 | `GET /v1/models/status` | 15.3 KB | ~19 ms | none | medium | per-model table, every ~30 s |
-| `GET /admin/api/stats` | ~2 KB | ~5 ms | admin session / Bearer key | low | optional: server memory thresholds |
+| `GET /admin/api/stats` | ~2 KB | ~5 ms | admin session / Bearer key | low | *not used in v1*: its guard thresholds are redundant with the kernel pressure level and the model ceiling |
 | `GET /admin/api/activity` | ~400 B | ~3 ms | admin session / Bearer key | low | *not used in v1* (same auth constraints as `/api/stats`) |
 | `GET /admin/api/usage` | ~1 KB | ~3 ms | admin session / Bearer key | low | *not used in v1* (hourly history) |
 
@@ -442,7 +442,6 @@ convert one into the other.
 | `/health` fallback | only when `/api/status` fails or returns 503 | — | discriminates loading vs down |
 | OS counters (proc/vm/gpu) | every tick | same tick | µs each |
 | `/v1/models/status` | every 15th tick (~30 s), plus on `m`, plus on startup | internal | 19 ms server cost |
-| `/admin/api/stats` | every 5th tick, only if the first attempt returned 200 | `--admin` to force probe | optional thresholds |
 
 `--interval` accepts 500 ms–60 s, clamped with a warning.
 
@@ -477,11 +476,34 @@ loop {
 - HTTP timeout 1 s per request, connect timeout 500 ms.
 - On connection failure: back off to 5 s, keep sampling OS counters, mark
   `server.reachable = false`, retain the last successful serving block with an
-  age stamp (`last seen 12 s ago`).
+  age stamp (`last seen 12 s ago`). If the server pid is still alive, the badge
+  is `unresponsive` rather than `unreachable` (§7.2): a model load blocks the
+  Python event loop, and calling a live process "down" is wrong.
 - PID cache and instance selection: see §6.3.5.
 - GPU read failure (property missing) → `gpu: None`, panel shows `n/a`, no error
   spam.
-- Admin probe failure → disable that panel for the rest of the session.
+- Admin endpoints are not called at all in v1 (§2.3), so there is no admin panel
+  to degrade.
+
+**Thread model.** Two producers, one consumer, no polling:
+
+- `sampler` owns the HTTP client and the OS probes. It waits on
+  `recv_timeout(until_deadline)` from a command channel, so pause, interval
+  changes and refreshes take effect immediately while the thread sleeps
+  otherwise. It publishes `Msg::Snapshot`.
+- `input` blocks on `crossterm::event::read()` and forwards `Msg::Input(event)`
+  into the same channel. Resize events arrive this way; there is no `poll()`
+  loop and no periodic wake-up.
+- the UI thread blocks on `recv()` of the merged channel and redraws only when a
+  message arrives. Idle cost is therefore zero wake-ups between ticks.
+
+Commands (UI → sampler): `Pause`, `Resume`, `SetInterval(Duration)`,
+`RefreshNow`, `RefreshModels`, `Retarget(Instance)`, `Stop`.
+
+**Terminal hygiene.** Raw mode and the alternate screen are released by an RAII
+guard on normal exit, on `q`/`Esc`, and in a panic hook installed before
+entering the TUI — `panic = "abort"` still runs the hook, and a monitor that
+leaves the shell in raw mode after a crash is worse than the crash.
 
 ### 6.3 Instance discovery
 
@@ -642,7 +664,8 @@ Status badge states:
 |---|---|
 | `healthy` (green) | last 200, `status == "ok"` |
 | `loading` (yellow) | 503 with `status == "loading"` |
-| `unreachable` (red) | connection error / timeout, with `last seen Ns ago` |
+| `unresponsive` (yellow) | transport timeout **and** the server pid still exists — a model load or heavy prefill holds the GIL and blocks the event loop for seconds |
+| `unreachable` (red) | transport error / timeout with no live server pid, with `last seen Ns ago` |
 | `auth` (red) | 401/403, hint `--api-key` |
 | `degraded` (yellow) | 200 but payload missing expected fields |
 
@@ -671,6 +694,23 @@ Status badge states:
 No key writes anything. The tool is read-only; there is no `u`/`load` binding by
 design.
 
+### 7.5 Models table
+
+One row per non-built-in model (§2.3). Columns: `▸` when loaded, id truncated to
+the available width, `engine_type`/`model_type`, context window, estimated size
+(`actual_size` when the server reports one), and state (`loaded`, `loading`,
+`—`). Sort: loaded first, then loading, then alphabetical by id.
+
+Default view is loaded + loading only; `a` switches to every discovered model.
+The header of the panel states the counts and the current mode
+(`2 loaded / 19 discovered — a for all`). Scrolling with `↑`/`↓`/`PgUp`/`PgDn`
+applies to whichever view is active and is clamped to the row count; the
+selected row is highlighted and its full id is shown in the footer line when it
+is truncated.
+
+The rows come from the same `/v1/models/status` response as the counters, so a
+row marked `loaded` and the `loaded_count` cannot disagree.
+
 ## 8. CLI and environment
 
 ```
@@ -685,7 +725,6 @@ omlx-top [OPTIONS]
   --once               print one snapshot as text, exit 0/1
   --json               print one snapshot as JSON, exit 0/1 (implies --once)
   --list               print discovered instances (mode, pid, port) and exit
-  --admin              probe /admin/api/stats even without prior success
   --no-color           disable styling
   -h, --help
   -V, --version
@@ -783,11 +822,11 @@ source answers, both are `null`.
 | Failure | Behaviour |
 |---|---|
 | Server not running | red `unreachable` badge; OS panels keep updating; serving/model panels show last values greyed with age |
+| Server alive but HTTP times out (model load, GIL held) | yellow `unresponsive` badge; process panels keep updating; serving block goes stale with its age; retry after the normal back-off |
 | 503 `loading` | yellow `loading` badge; model gauge shows `loading`; keep polling |
-| 401/403 | red `auth` badge; hide admin probe; suggest `--api-key` |
+| 401/403 | red `auth` badge; hide the serving/model panels; suggest `--api-key` |
 | Malformed / short JSON | `degraded` badge; keep last good values; log once per field, not per tick |
 | `/v1/models/status` fails | models table keeps previous rows, marked stale; serving block unaffected |
-| Admin endpoint 401 | admin-dependent rows hidden for the session, no retry |
 | `IOAccelerator` missing/changed | GPU panel `n/a`; no error banner; rest of the app unaffected |
 | `proc_pid_rusage` fails on a cached pid | re-resolve pids; if still failing, show `—` |
 | Plist installed, service not running | red `unreachable` + hint `brew services start omlx`; one `stat` on the plist, no `launchctl` spawn |
@@ -902,8 +941,8 @@ No network in tests. No test may require a running oMLX.
       (`brew services start omlx`, monitor launched with no arguments), `manual`
       (`omlx serve` in a shell), and two instances at once (`--list` + `i`).
 - [ ] Behaviour confirmed against the matrix in §9: server stopped, service
-      stopped with plist present, server loading, admin 401, GPU property
-      removed, service running as another user.
+      stopped with plist present, server loading, 401, GPU property removed,
+      service running as another user.
 - [ ] Performance budget in §10 met on the reference machine.
 - [ ] README documents sources, formulas, limitations, deployment discovery, and
       the 2 s interval rationale.

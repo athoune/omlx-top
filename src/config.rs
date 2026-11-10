@@ -10,7 +10,7 @@
 //! 6. 8000 as the documented default when no probe answers.
 //!
 //! Step 5 is injected as a closure so precedence can be tested without a live
-//! server. The HTTP client itself belongs to a later batch.
+//! server; the HTTP client itself lives in [`crate::http`].
 
 use std::fmt;
 use std::path::PathBuf;
