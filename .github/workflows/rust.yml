@@ -5,23 +5,26 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  release:
+    types: [ published ]
 
 env:
   CARGO_TERM_COLOR: always
+  TARGET: aarch64-apple-darwin
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-
-    # The crate targets aarch64-apple-darwin and refuses to compile elsewhere
-    # (compile_error! in src/main.rs), so Linux runners cannot build it.
+  test:
     runs-on: macos-latest
-
     steps:
     - uses: actions/checkout@v4
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
+        targets: aarch64-apple-darwin
     - name: Check formatting
       run: cargo fmt --check
     - name: Clippy
@@ -29,4 +32,66 @@ jobs:
     - name: Run tests
       run: cargo test
     - name: Build release
-      run: cargo build --release
+      run: cargo build --release --target "$TARGET"
+
+  release:
+    if: github.event_name == 'release'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    outputs:
+      digests: ${{ steps.hash.outputs.digests }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-apple-darwin
+    - name: Build release binary
+      run: cargo build --release --target "$TARGET"
+    - name: Check the binary is Apple Silicon
+      run: |
+        set -euo pipefail
+        arch="$(lipo -archs "target/$TARGET/release/omlx-top")"
+        echo "binary architecture: $arch"
+        test "$arch" = "arm64"
+    - name: Package
+      run: |
+        set -euo pipefail
+        tag="${GITHUB_REF_NAME}"
+        version="${tag#v}"
+        manifest="$(cargo metadata --no-deps --format-version 1 \
+          | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+        if [ "$version" != "$manifest" ]; then
+          echo "release tag $tag does not match Cargo.toml version $manifest" >&2
+          exit 1
+        fi
+        name="omlx-top-${tag}-${TARGET}"
+        mkdir -p dist/stage
+        cp "target/$TARGET/release/omlx-top" dist/stage/
+        cp LICENSE README.md dist/stage/
+        tar -czf "dist/${name}.tar.gz" -C dist/stage .
+        rm -rf dist/stage
+        (cd dist && shasum -a 256 "${name}.tar.gz" > SHA256SUMS)
+        cat dist/SHA256SUMS
+    - name: Upload release assets
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz dist/SHA256SUMS --clobber
+    - name: Generate provenance subject
+      id: hash
+      run: |
+        set -euo pipefail
+        echo "digests=$(cd dist && shasum -a 256 *.tar.gz | base64 | tr -d '\n')" >> "$GITHUB_OUTPUT"
+
+  provenance:
+    if: github.event_name == 'release'
+    needs: [ release ]
+    permissions:
+      actions: read    # Required to detect the GitHub Actions environment.
+      id-token: write  # Required to sign the provenance.
+      contents: write  # Required to upload the provenance to the release.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.release.outputs.digests }}"
+      upload-assets: true
